@@ -96,7 +96,10 @@ review；过程日志在 `logs/` 下；会话期间日志文件通常是空的�
 
 1. **发现**：每个仓库用 GitHub Search GraphQL 查 `review-requested:<该仓库的 reviewer>` 的
    open PR；另外扫描最近 N 小时内的 issue/PR 评论中 `@<reviewer>` 的提及。
-2. **去重**：`state.json` 记录已处理/已 review 的 PR 与评论 id，避免重复触发。
+2. **去重与 re-request**：`state.json` 记录已处理/已 review 的 PR（含当时的 head_sha）与评论 id，
+   避免重复触发。如果某个 PR 之后又被 re-request review，仅当**内容有变化**时才重新审查：
+   PR head 出现了新 commit，或之前的 review 已被 dismiss；否则跳过。
+   正在运行中的 review session 也不会被重复触发。
 3. **审查**：每个新 PR 启动一个 DSH headless session，prompt 指引 agent：
    在对应仓库的 git worktree 里拉取该 PR 的 head，`git diff` 对比 base 分支，逐文件阅读，
    按 custom prompt 审计，最后用 `gh api .../pulls/N/reviews` 一次性提交 review

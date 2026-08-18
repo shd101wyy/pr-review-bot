@@ -102,10 +102,10 @@ handled_pr() { jq -e --arg k "$(KEY "$1" "$2")" '.handled_prs[$k] != null' "$STA
 handled_comment() { jq -e --arg c "$1" '.handled_comments[$c] != null' "$STATE_FILE" >/dev/null 2>&1; }
 save_state() { mv "$STATE_FILE.tmp" "$STATE_FILE"; }
 mark_handled_pr() {
-  local key pr reason log
-  key="$(KEY "$1" "$2")"; pr="$2"; reason="$3"; log="$4"
-  jq --arg k "$key" --arg p "$pr" --arg r "$reason" --arg l "$log" --arg t "$NOW_ISO" \
-    '.handled_prs[$k] = {pr: $p, triggered_at: $t, reason: $r, session_log: $l}' \
+  local key pr reason log head_sha
+  key="$(KEY "$1" "$2")"; pr="$2"; reason="$3"; log="$4"; head_sha="${5:-}"
+  jq --arg k "$key" --arg p "$pr" --arg r "$reason" --arg l "$log" --arg t "$NOW_ISO" --arg h "$head_sha" \
+    '.handled_prs[$k] = {pr: $p, triggered_at: $t, reason: $r, session_log: $l, head_sha: $h}' \
     "$STATE_FILE" > "$STATE_FILE.tmp" && save_state
 }
 mark_handled_comment() {
@@ -117,6 +117,15 @@ mark_handled_comment() {
 
 # --- per-repo effective config lookup ------------------------------------------
 eff_repo() { jq -c --arg r "$1" '.repos[] | select(.repo == $r)' "$EFFECTIVE_FILE" 2>/dev/null; }
+
+# --- github helpers -------------------------------------------------------------
+head_of() { "$GH" api "repos/$1/pulls/$2" -q .head.sha 2>/dev/null || echo ""; }
+reviewed_by() {  # prints non-empty if $3 has a live (non-dismissed) review on repo $1 pr $2
+  local rv
+  rv=$("$GH" api "repos/$1/pulls/$2/reviews" --paginate \
+    -q '.[] | select(.user.login == "'"$3"'") | select(.state != "DISMISSED")' 2>/dev/null | head -c1)
+  printf '%s' "$rv"
+}
 
 # --- ensure a git mirror exists for a repo (parallel-safe via flock) ----------
 ensure_mirror() {
@@ -180,7 +189,7 @@ launch_review() {
   local SESSION_LOG="$LOG_DIR/session-pr-$pr-$(date +%Y%m%d-%H%M%S).log"
   local PROMPT_FILE="$LOG_DIR/prompt-$SAFE_REPO-$pr.txt"
   local MODEL_PATCH="$STATE_DIR/model-patch-$SAFE_REPO.yml"
-  local base_ref reviewer custom_prompt
+  local pair base_ref head_sha reviewer custom_prompt
   local mprovider mname meffort
   local entry
 
@@ -191,6 +200,10 @@ launch_review() {
   mprovider="$(jq -r '.model.provider' <<<"$entry")"
   mname="$(jq -r '.model.model' <<<"$entry")"
   meffort="$(jq -r '.model.reasoningEffort' <<<"$entry")"
+
+  pair="$("$GH" api "repos/$repo/pulls/$pr" -q '"\(.base.ref)\t\(.head.sha)"' 2>/dev/null || true)"
+  base_ref="${pair%%$'\t'*}"; [ -n "$base_ref" ] || base_ref="main"
+  head_sha="${pair##*$'\t'}"
 
   # per-repo model patch
   {
@@ -261,8 +274,8 @@ EOF
       "$(cat "$PROMPT_FILE")" > "$SESSION_LOG" 2>&1 &
     echo $! > "$STATE_DIR/session-pr-$SAFE_REPO-$pr.pid"
   )
-  mark_handled_pr "$repo" "$pr" "$reason" "$SESSION_LOG"
-  log "PR #$repo/$pr: session launched, log: $SESSION_LOG"
+  mark_handled_pr "$repo" "$pr" "$reason" "$SESSION_LOG" "$head_sha"
+  log "PR #$repo/$pr: session launched (head $head_sha), log: $SESSION_LOG"
 }
 
 # --- main: discover + throttle + launch ---------------------------------------
@@ -291,23 +304,51 @@ main() {
     [ "$launched" -ge "$MAX_SESSIONS_PER_POLL" ] && break
     repo="${key%%#*}"; pr="${key##*#}"
     [ -n "$pr" ] || continue
-    handled_pr "$repo" "$pr" && continue
-
+    reason="${CANDIDATES[$key]}"
     reviewer="$(eff_repo "$repo" | jq -r '.reviewer')"
-    reviewed=$("$GH" api "repos/$repo/pulls/$pr/reviews" --paginate \
-      -q '.[] | select(.user.login == "'"$reviewer"'") | select(.state != "DISMISSED")' 2>/dev/null | head -c1)
+
+    # --- already handled: only re-review when the PR was re-requested AND changed
+    if handled_pr "$repo" "$pr"; then
+      if [ "$reason" != "review_requested" ]; then
+        log "PR #$repo/$pr: handled ($(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].reason' "$STATE_FILE")) — skip"
+        continue
+      fi
+      # a review session is already running right now — never double-launch
+      pidfile="$STATE_DIR/session-pr-$(echo "$repo" | tr '/' '-')-$pr.pid"
+      if [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null) && kill -0 "$pid" 2>/dev/null; then
+        log "PR #$repo/$pr: review session already running (pid $pid) — skip"
+        continue
+      fi
+      cur_sha="$(head_of "$repo" "$pr")"
+      last_sha="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].head_sha // ""' "$STATE_FILE")"
+      reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"
+      if [ -n "$reviewed" ] && { [ -z "$last_sha" ] || [ "$cur_sha" = "$last_sha" ]; }; then
+        log "PR #$repo/$pr: re-requested but no change (head $cur_sha, review still up) — skip"
+        continue
+      fi
+      log "PR #$repo/$pr: re-requested with change (head ${last_sha:-?} -> ${cur_sha:-?}, live review: $([ -n "$reviewed" ] && echo yes || echo no)) — re-reviewing"
+      if [ "${DRY_RUN:-0}" = "1" ]; then
+        launched=$((launched+1)); continue
+      fi
+      launch_review "$repo" "$pr" "re-request"
+      launched=$((launched+1))
+      continue
+    fi
+
+    # --- new candidate
+    reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"
     if [ -n "$reviewed" ]; then
       log "PR #$repo/$pr: already reviewed by $reviewer — marking handled, skip"
-      mark_handled_pr "$repo" "$pr" "already_reviewed" ""
+      mark_handled_pr "$repo" "$pr" "already_reviewed" "" "$(head_of "$repo" "$pr")"
       continue
     fi
 
     if [ "${DRY_RUN:-0}" = "1" ]; then
-      log "PR #$repo/$pr: DRY_RUN — would launch session (reason=${CANDIDATES[$key]})"
+      log "PR #$repo/$pr: DRY_RUN — would launch session (reason=$reason)"
       launched=$((launched+1))
       continue
     fi
-    launch_review "$repo" "$pr" "${CANDIDATES[$key]}"
+    launch_review "$repo" "$pr" "$reason"
     launched=$((launched+1))
   done
 
