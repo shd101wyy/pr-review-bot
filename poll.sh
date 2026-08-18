@@ -253,12 +253,18 @@ Do the review from the worktree:
 3. Audit per the custom instructions above. For EVERY finding, prefer an INLINE comment: pick {path, line (a line number inside the diff hunk, right side), body}. Group findings, then post them in ONE review:
 
    gh api repos/$repo/pulls/$pr/reviews --input - <<'JSON'
-   {"event":"COMMENT","body":"<concise summary of the audit>","comments":[{"path":"<file>","line":<n>,"body":"<finding>"}]}
+   {"event":"APPROVE","body":"<concise summary of the audit>","comments":[{"path":"<file>","line":<n>,"body":"<finding>"}]}
    JSON
 
-   - Use event REQUEST_CHANGES when there are blocking issues, event COMMENT for minor points, event APPROVE only if the PR is genuinely ready (be conservative — almost never approve).
-   - If a comment's line is rejected as outside the hunk, drop the line and fold the finding into the summary body (or post it as a plain PR comment via gh api repos/$repo/issues/$pr/comments -f body=...).
-   - Write the review in the same language as the PR.
+   Decide the event:
+   - APPROVE: the audit found NO blocking problems (minor/optional notes are fine and may
+     still be attached as inline comments to the approve). Approving is the expected normal
+     outcome when the change is correct, safe, secure and clean — do not hold it back.
+   - REQUEST_CHANGES: only when there are real blocking issues that must be fixed first.
+   - COMMENT: only when you are unsure or the PR is an early draft.
+   If a comment's line is rejected as outside the hunk, drop the line and fold the finding
+   into the summary body (or post it as a plain PR comment via gh api repos/$repo/issues/$pr/comments -f body=...).
+   Write the review in the same language as the PR.
 
 4. After posting, remove the worktree to keep things tidy:
    git --git-dir="$mirror" worktree remove --force "$wt" 2>/dev/null || true

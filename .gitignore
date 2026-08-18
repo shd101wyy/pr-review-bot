@@ -4,3 +4,7 @@ logs/
 worktrees/
 git/
 *.pid
+scratch/
+.jspace/
+review.json
+*.diff

@@ -103,7 +103,8 @@ review；过程日志在 `logs/` 下；会话期间日志文件通常是空的�
 3. **审查**：每个新 PR 启动一个 DSH headless session，prompt 指引 agent：
    在对应仓库的 git worktree 里拉取该 PR 的 head，`git diff` 对比 base 分支，逐文件阅读，
    按 custom prompt 审计，最后用 `gh api .../pulls/N/reviews` 一次性提交 review
-   （inline comments 优先，blocking 问题给 REQUEST_CHANGES）。
+   （inline comments 优先）。结果判定：**没有 blocking 问题时 approve 是正常终点**（可附带
+   inline 建议）；有阻塞问题才 REQUEST_CHANGES；拿不准/草稿阶段用 COMMENT。
 4. **清理**：session 结束后自动移除 worktree，多个 PR 并行互不冲突。
 
 ## 调度（systemd 用户级 timer）
