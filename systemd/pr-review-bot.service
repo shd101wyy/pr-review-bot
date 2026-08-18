@@ -1,0 +1,13 @@
+[Unit]
+Description=SkardiCloud PR review bot — poll configured repos for review requests
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/deck/Workspace/pr-review-bot/poll.sh
+StandardOutput=append:/home/deck/Workspace/pr-review-bot/logs/poll.log
+StandardError=append:/home/deck/Workspace/pr-review-bot/logs/poll.log
+
+[Install]
+WantedBy=default.target

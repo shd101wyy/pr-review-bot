@@ -101,13 +101,39 @@ review；过程日志在 `logs/` 下；会话期间日志文件通常是空的�
    （inline comments 优先，blocking 问题给 REQUEST_CHANGES）。
 4. **清理**：session 结束后自动移除 worktree，多个 PR 并行互不冲突。
 
-## 调度
+## 调度（systemd 用户级 timer）
 
-systemd 用户级 timer 每分钟唤醒一次，脚本按 `poll_interval_minutes` 节流：
+轮询由 systemd 用户级 timer 驱动：timer 每分钟唤醒 `pr-review-bot.service`（oneshot），
+脚本按 `config.json` 的 `poll_interval_minutes` 节流，所以改频率只改配置文件即可。
+
+**unit 文件定义在哪里？** 不在本仓库里，而是安装在 systemd 的用户目录：
+
+```
+~/.config/systemd/user/pr-review-bot.service   # 实际工作单元（ExecStart=poll.sh）
+~/.config/systemd/user/pr-review-bot.timer     # 每分钟触发的 timer
+```
+
+`enable` 时 systemd 会在 `~/.config/systemd/user/timers.target.wants/` 下创建一个指向
+timer 的符号链接来实现开机自启。
+
+本仓库的 `systemd/` 目录保存了这两个 unit 文件的副本（随代码一起版本化）。检查或安装：
 
 ```bash
-systemctl --user status pr-review-bot.timer
-systemctl --user cat pr-review-bot.service
+# 查看定义与状态
+systemctl --user cat pr-review-bot.timer
+systemctl --user list-timers pr-review-bot.timer
+
+# 从仓库重新安装（覆盖到 systemd 用户目录后重载）
+cp systemd/pr-review-bot.service systemd/pr-review-bot.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# 开启（激活 + 开机自启）/ 暂停 / 彻底停用
+systemctl --user enable --now pr-review-bot.timer
+systemctl --user stop pr-review-bot.timer
+systemctl --user disable --now pr-review-bot.timer
+
+# 立即跑一轮
+systemctl --user start pr-review-bot.service   # 或 ./run-now.sh
 ```
 
 ## 故障排查

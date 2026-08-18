@@ -1,0 +1,8 @@
+[Unit]
+Description=Run the PR review bot poller every minute (script throttles to poll_interval_minutes)
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+[Install]
+WantedBy=timers.target
