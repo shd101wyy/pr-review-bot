@@ -1,0 +1,6 @@
+config.json
+state/
+logs/
+worktrees/
+git/
+*.pid
