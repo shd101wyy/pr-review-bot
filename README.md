@@ -10,9 +10,11 @@
 ```
 pr-review-bot/
 ├── config.json        # 所有可配置项（不在 git 版本控制内）
+├── config.example.json # 可移植配置模板
 ├── poll.sh            # 核心逻辑：发现候选 PR -> 启动 headless review session（timer 每 1 分钟调用）
 ├── run-now.sh         # 手动控制：立即轮询 / 手动 review 某个 PR / 查看状态
 ├── status.sh          # 查看当前状态（正在 review 哪些 PR、历史、等待队列）
+├── systemd/           # systemd 用户级 unit 文件副本（service + timer，安装见下文「调度」）
 ├── git/               # 每个仓库一个 mirror clone（内部实现，勿手改）
 ├── worktrees/         # 每个 PR 一个 worktree（内部实现，审查完自动清理）
 ├── logs/              # 每个 review session 的完整日志 + 生成的 prompt
