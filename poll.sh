@@ -256,12 +256,11 @@ Do the review from the worktree:
    {"event":"APPROVE","body":"<concise summary of the audit>","comments":[{"path":"<file>","line":<n>,"body":"<finding>"}]}
    JSON
 
-   Decide the event:
-   - APPROVE: the audit found NO blocking problems (minor/optional notes are fine and may
-     still be attached as inline comments to the approve). Approving is the expected normal
-     outcome when the change is correct, safe, secure and clean — do not hold it back.
-   - REQUEST_CHANGES: only when there are real blocking issues that must be fixed first.
-   - COMMENT: only when you are unsure or the PR is an early draft.
+   Decide the event by ONE rule:
+   - APPROVE whenever there are NO blocking problems. All suggestions and minor notes must be
+     attached as inline comments to the approve — they never block it.
+   - REQUEST_CHANGES only when at least one blocking issue must be fixed before merge.
+   - COMMENT only when you are unsure or the PR is an early draft.
    If a comment's line is rejected as outside the hunk, drop the line and fold the finding
    into the summary body (or post it as a plain PR comment via gh api repos/$repo/issues/$pr/comments -f body=...).
    Write the review in the same language as the PR.
