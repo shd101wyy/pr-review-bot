@@ -99,7 +99,8 @@ review；过程日志在 `logs/` 下；会话期间日志文件通常是空的�
 2. **去重与 re-request**：`state.json` 记录已处理/已 review 的 PR（含当时的 head_sha）与评论 id，
    避免重复触发。如果某个 PR 之后又被 re-request review，仅当**内容有变化**时才重新审查：
    PR head 出现了新 commit，或之前的 review 已被 dismiss；否则跳过。
-   正在运行中的 review session 也不会被重复触发。
+   **review 进行中若 PR 出现新 commit，poller 会立即终止进行中的 session，并在同一轮
+   为新 commit 重新开启 review**（发现延迟 ≤ poll_interval_minutes，可调小以获得更快的响应）。
 3. **审查**：每个新 PR 启动一个 DSH headless session，prompt 指引 agent：
    在对应仓库的 git worktree 里拉取该 PR 的 head，`git diff` 对比 base 分支，逐文件阅读，
    按 custom prompt 审计，最后用 `gh api .../pulls/N/reviews` 一次性提交 review

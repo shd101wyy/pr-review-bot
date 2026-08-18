@@ -318,13 +318,25 @@ main() {
         log "PR #$repo/$pr: handled ($(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].reason' "$STATE_FILE")) — skip"
         continue
       fi
-      # a review session is already running right now — never double-launch
+      # running session: if the PR head moved since the session started, kill it
+      # now and fall through to immediately re-review the new commit
       pidfile="$STATE_DIR/session-pr-$(echo "$repo" | tr '/' '-')-$pr.pid"
-      if [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null) && kill -0 "$pid" 2>/dev/null; then
-        log "PR #$repo/$pr: review session already running (pid $pid) — skip"
-        continue
-      fi
       cur_sha="$(head_of "$repo" "$pr")"
+      if [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null) && kill -0 "$pid" 2>/dev/null; then
+        run_sha="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].head_sha // ""' "$STATE_FILE")"
+        if [ -n "$cur_sha" ] && [ -n "$run_sha" ] && [ "$cur_sha" != "$run_sha" ]; then
+          if [ "${DRY_RUN:-0}" = "1" ]; then
+            log "PR #$repo/$pr: PR head changed while reviewing ($run_sha -> $cur_sha) — DRY_RUN: would kill in-flight session (pid $pid)"
+            launched=$((launched+1)); continue
+          fi
+          log "PR #$repo/$pr: PR head changed while reviewing ($run_sha -> $cur_sha) — killing in-flight session (pid $pid)"
+          kill "$pid" 2>/dev/null || true
+          rm -f "$pidfile"
+        else
+          log "PR #$repo/$pr: review session already running (pid $pid) — skip"
+          continue
+        fi
+      fi
       last_sha="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].head_sha // ""' "$STATE_FILE")"
       reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"
       if [ -n "$reviewed" ] && { [ -z "$last_sha" ] || [ "$cur_sha" = "$last_sha" ]; }; then
