@@ -138,9 +138,20 @@ systemctl --user disable --now pr-review-bot.timer
 systemctl --user start pr-review-bot.service   # 或 ./run-now.sh
 ```
 
+### 路径可移植（跨机器 / 用户名不同）
+
+- 脚本完全自定位（`BOT_DIR`），仓库可以放在任何目录。
+- systemd unit 里**不能用 `~`**（systemd 不展开它），所以 service 用用户级 specifier
+  `%h` 表示主目录：`ExecStart=%h/Workspace/pr-review-bot/poll.sh`。
+  若你的仓库不在 `~/Workspace/pr-review-bot`，把两份 unit 拷贝安装前改一下
+  `%h/Workspace/...` 那段为实际路径即可（脚本内部不需要改）。
+- 工具路径（`gh`、`node`、DSH 的 `bin.js`）优先读环境变量 `GH` / `NODE` / `DSH_BIN`，
+  未提供时自动探测常见位置（`command -v`，其次 `~/.nix-profile/bin` 与 `~/.local/share/dsh`）。
+
 ## 故障排查
 
 - 私有仓库 clone/fetch 失败 → 确认 `gh auth status` 有 token；或在配置 `gh.token_env`
   指向一个含 GitHub token 的环境变量（例如在 systemd unit 或 shell 中 export）。
 - 模型不对 → 检查 `state/model-patch-<repo>.yml`，它由合并后的 effective 配置生成。
+- 机器上找不到 gh/node/DSH → 显式设置 `GH`、`NODE`、`DSH_BIN` 环境变量后重跑。
 - session 失败 → 查看对应 `logs/session-pr-*.log` 尾部报错。

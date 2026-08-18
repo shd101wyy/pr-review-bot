@@ -1,13 +1,14 @@
 [Unit]
-Description=SkardiCloud PR review bot — poll configured repos for review requests
+Description=PR review bot — poll configured repos for review requests
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/deck/Workspace/pr-review-bot/poll.sh
-StandardOutput=append:/home/deck/Workspace/pr-review-bot/logs/poll.log
-StandardError=append:/home/deck/Workspace/pr-review-bot/logs/poll.log
+# %h = the user's home directory. systemd units do NOT expand `~`.
+ExecStart=%h/Workspace/pr-review-bot/poll.sh
+StandardOutput=append:%h/Workspace/pr-review-bot/logs/poll.log
+StandardError=append:%h/Workspace/pr-review-bot/logs/poll.log
 
 [Install]
 WantedBy=default.target

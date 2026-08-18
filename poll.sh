@@ -15,13 +15,21 @@ STATE_FILE="$STATE_DIR/state.json"
 LOCK_FILE="$STATE_DIR/poll.lock"
 LAST_POLL_FILE="$STATE_DIR/last_poll"
 EFFECTIVE_FILE="$STATE_DIR/effective.json"
-GH="/home/deck/.nix-profile/bin/gh"
-NODE="/home/deck/.nix-profile/bin/node"
-DSH_BIN="/home/deck/.local/share/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-export PATH="/home/deck/.nix-profile/bin:/usr/bin:/bin"
-export HOME="/home/deck"
+export HOME="${HOME:-$(getent passwd "$(id -un)" | cut -d: -f6)}"
+
+# --- portable tool resolution (override each via env, else auto-discover) ----
+GH="${GH:-$(command -v gh 2>/dev/null || echo "$HOME/.nix-profile/bin/gh")}"
+NODE="${NODE:-$(command -v node 2>/dev/null || echo "$HOME/.nix-profile/bin/node")}"
+if [ -z "${DSH_BIN:-}" ]; then
+  for c in "$HOME/.local/share/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" \
+           /usr/local/share/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js; do
+    [ -f "$c" ] && DSH_BIN="$c" && break
+  done
+  [ -n "${DSH_BIN:-}" ] || DSH_BIN="$(command -v dsh 2>/dev/null || true)"
+fi
+export PATH="$(dirname "$GH"):/usr/bin:/bin:$PATH"
 
 log() { echo "[$(date -Is)] $*"; }
 
