@@ -120,11 +120,9 @@ eff_repo() { jq -c --arg r "$1" '.repos[] | select(.repo == $r)' "$EFFECTIVE_FIL
 
 # --- github helpers -------------------------------------------------------------
 head_of() { "$GH" api "repos/$1/pulls/$2" -q .head.sha 2>/dev/null || echo ""; }
-reviewed_by() {  # prints non-empty if $3 has a live (non-dismissed) review on repo $1 pr $2
-  local rv
-  rv=$("$GH" api "repos/$1/pulls/$2/reviews" --paginate \
-    -q '.[] | select(.user.login == "'"$3"'") | select(.state != "DISMISSED")' 2>/dev/null | head -c1)
-  printf '%s' "$rv"
+reviewed_by() {  # $3's latest live (non-dismissed) review commit_id on repo $1 pr $2; empty = no live review
+  "$GH" api "repos/$1/pulls/$2/reviews" --paginate \
+    -q '.[] | select(.user.login == "'"$3"'") | select(.state != "DISMISSED") | .commit_id' 2>/dev/null | tail -1
 }
 
 # --- report review sessions interrupted by a reboot/crash -----------------------
@@ -371,13 +369,13 @@ main() {
         fi
       fi
 
-      reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"
-      if [ -n "$reviewed" ] && { [ -z "$last_sha" ] || [ "$cur_sha" = "$last_sha" ]; }; then
-        log "PR #$repo/$pr: re-requested but no change (head $cur_sha, review still up) — skip"
+      reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"   # latest live review's commit_id ("" = none)
+      if [ -n "$reviewed" ] && [ "$cur_sha" = "$reviewed" ]; then
+        log "PR #$repo/$pr: re-requested but no change (head $cur_sha, review still targets it) — skip"
         rm -f "$pidfile"
         continue
       fi
-      log "PR #$repo/$pr: re-requested with change (head ${last_sha:-?} -> ${cur_sha:-?}, live review: $([ -n "$reviewed" ] && echo yes || echo no)) — re-reviewing"
+      log "PR #$repo/$pr: re-requested with change (head $cur_sha, last review targeted ${reviewed:-none}, live review: $([ -n "$reviewed" ] && echo yes || echo no)) — re-reviewing"
       if [ "${DRY_RUN:-0}" = "1" ]; then
         launched=$((launched+1)); continue
       fi
