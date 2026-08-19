@@ -15,8 +15,7 @@ case "${1:-}" in
   poll)   FORCE=1 exec "$BOT_DIR/poll.sh";;
 esac
 
-export PATH="/home/deck/.nix-profile/bin:/usr/bin:/bin"
-export HOME="/home/deck"
+# tool paths / HOME are resolved dynamically by poll.sh (source below)
 
 # shellcheck disable=SC1091
 . "$BOT_DIR/poll.sh"   # loads config + helpers; sourcing acquires the lock (fine)

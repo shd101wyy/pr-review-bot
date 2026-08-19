@@ -55,7 +55,7 @@ load_config() {
   # merge: per-repo fields fall back to global fields
   jq '{ repos: [ .repos[] | . as $r |
     {
-      repo: $r.repo,
+      repo: ($r.repo // ""),
       reviewer: ($r.reviewer // $root.reviewer // ""),
       model: {
         provider: ($r.model.provider // $root.model.provider // ""),
@@ -274,9 +274,8 @@ launch_review() {
     [ -n "$meffort" ] && printf '    reasoningEffort: %s\n' "$meffort"
   } > "$MODEL_PATCH"
 
-  base_ref="$("$GH" api "repos/$repo/pulls/$pr" -q .base.ref 2>/dev/null || echo main)"
-
   # manage the "review in progress" status comment on the PR
+  local status_cid old_cid
   status_cid=""
   old_cid="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].status_comment // ""' "$STATE_FILE" 2>/dev/null)"
   if [ -n "$old_cid" ]; then

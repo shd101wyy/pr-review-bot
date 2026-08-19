@@ -66,9 +66,11 @@ while IFS= read -r repo; do
   while read -r p; do
     [ -n "$p" ] || continue
     PENDING["$repo#$p"]=""
-    rv=$("$GH" api "repos/$repo/pulls/$p/reviews" --paginate \
-      -q '.[] | select(.user.login == "'"$reviewer"'") | select(.state != "DISMISSED")' 2>/dev/null | head -c1)
-    [ -n "$rv" ] && PENDING["$repo#$p"]="reviewed"
+    rc=$("$GH" api "repos/$repo/pulls/$p/reviews" --paginate \
+      -q '.[] | select(.user.login == "'"$reviewer"'") | select(.state != "DISMISSED") | .commit_id' 2>/dev/null | tail -1)
+    if [ -n "$rc" ] && [ "$(head_of "$repo" "$p")" = "$rc" ]; then
+      PENDING["$repo#$p"]="reviewed"
+    fi
   done < <("$GH" api graphql \
     -f query="query { search(query: \"repo:$repo is:pr is:open review-requested:$reviewer\", type: ISSUE, first: 100) { edges { node { ... on PullRequest { number } } } } }" \
     -q '.data.search.edges[].node.number' 2>/dev/null)
