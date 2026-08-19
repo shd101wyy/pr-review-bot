@@ -109,6 +109,10 @@ review；过程日志在 `logs/` 下；会话期间日志文件通常是空的�
    拿不准/草稿阶段用 COMMENT。
 4. **清理**：session 结束后自动移除 worktree，多个 PR 并行互不冲突。
 
+**进行中提示**：review 触发时会在 PR 上发一条"正在 review"评论，说明 reviewer、所用
+provider/model 与 reasoning effort、以及正在审查的目标 HEAD commit；review 落地后该评论被
+删除（agent 完成后自行删除 + poller 兜底清理），让团队随时知道目前谁在审、审的是哪个 commit。
+
 ## 调度（systemd 用户级 timer）
 
 轮询由 systemd 用户级 timer 驱动：timer 每分钟唤醒 `pr-review-bot.service`（oneshot），

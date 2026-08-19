@@ -102,11 +102,15 @@ handled_pr() { jq -e --arg k "$(KEY "$1" "$2")" '.handled_prs[$k] != null' "$STA
 handled_comment() { jq -e --arg c "$1" '.handled_comments[$c] != null' "$STATE_FILE" >/dev/null 2>&1; }
 save_state() { mv "$STATE_FILE.tmp" "$STATE_FILE"; }
 mark_handled_pr() {
-  local key pr reason log head_sha
-  key="$(KEY "$1" "$2")"; pr="$2"; reason="$3"; log="$4"; head_sha="${5:-}"
-  jq --arg k "$key" --arg p "$pr" --arg r "$reason" --arg l "$log" --arg t "$NOW_ISO" --arg h "$head_sha" \
-    '.handled_prs[$k] = {pr: $p, triggered_at: $t, reason: $r, session_log: $l, head_sha: $h}' \
+  local key pr reason log head_sha status_comment
+  key="$(KEY "$1" "$2")"; pr="$2"; reason="$3"; log="$4"; head_sha="${5:-}"; status_comment="${6:-}"
+  jq --arg k "$key" --arg p "$pr" --arg r "$reason" --arg l "$log" --arg t "$NOW_ISO" --arg h "$head_sha" --arg sc "$status_comment" \
+    '.handled_prs[$k] = {pr: $p, triggered_at: $t, reason: $r, session_log: $l, head_sha: $h, status_comment: $sc}' \
     "$STATE_FILE" > "$STATE_FILE.tmp" && save_state
+}
+clear_status_comment() {
+  local key="$1"
+  jq --arg k "$key" 'del(.handled_prs[$k].status_comment)' "$STATE_FILE" > "$STATE_FILE.tmp" && save_state
 }
 mark_handled_comment() {
   local cid="$1" pr="$2" repo="$3"
@@ -123,6 +127,35 @@ head_of() { "$GH" api "repos/$1/pulls/$2" -q .head.sha 2>/dev/null || echo ""; }
 reviewed_by() {  # $3's latest live (non-dismissed) review commit_id on repo $1 pr $2; empty = no live review
   "$GH" api "repos/$1/pulls/$2/reviews" --paginate \
     -q '.[] | select(.user.login == "'"$3"'") | select(.state != "DISMISSED") | .commit_id' 2>/dev/null | tail -1
+}
+
+# Post a "review in progress" comment on the PR; prints the new comment id.
+post_status_comment() {  # repo pr reviewer provider model effort head_sha
+  local repo="$1" pr="$2" reviewer="$3" mprovider="$4" mname="$5" meffort="$6" sha="$7"
+  local body
+  body="@$reviewer is now reviewing this PR using DeepSeek Harness — $mprovider/$mname${meffort:+ (reasoning effort $meffort)}. Target HEAD commit: https://github.com/$repo/commit/$sha (\`${sha:0:7}\`)."
+  "$GH" api --method POST "repos/$repo/issues/$pr/comments" -f "body=$body" -q .id 2>/dev/null || echo ""
+}
+
+# --- clean up stale "review in progress" comments ------------------------------
+# Once a live review exists for the current head, any lingering status comment is
+# removed (the agent deletes it too; this is the poller's safety net).
+cleanup_status_comments() {
+  local key repo pr cid reviewer reviewed cur
+  while IFS=# read -r repo pr; do
+    [ -n "$repo" ] && [ -n "$pr" ] || continue
+    key="$(KEY "$repo" "$pr")"
+    cid="$(jq -r --arg k "$key" '.handled_prs[$k].status_comment // ""' "$STATE_FILE" 2>/dev/null)"
+    [ -n "$cid" ] || continue
+    reviewer="$(eff_repo "$repo" | jq -r '.reviewer')"
+    reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"
+    cur="$(head_of "$repo" "$pr")"
+    if [ -n "$reviewed" ] && [ "$cur" = "$reviewed" ]; then
+      "$GH" api --method DELETE "repos/$repo/issues/comments/$cid" >/dev/null 2>&1 || true
+      clear_status_comment "$key"
+      log "PR #$repo/$pr: removed 'reviewing in progress' comment (id $cid, review done)"
+    fi
+  done < <(jq -r '.handled_prs | keys[]' "$STATE_FILE" 2>/dev/null)
 }
 
 # --- report review sessions interrupted by a reboot/crash -----------------------
@@ -243,6 +276,15 @@ launch_review() {
 
   base_ref="$("$GH" api "repos/$repo/pulls/$pr" -q .base.ref 2>/dev/null || echo main)"
 
+  # manage the "review in progress" status comment on the PR
+  status_cid=""
+  old_cid="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].status_comment // ""' "$STATE_FILE" 2>/dev/null)"
+  if [ -n "$old_cid" ]; then
+    "$GH" api --method DELETE "repos/$repo/issues/comments/$old_cid" >/dev/null 2>&1 || true
+  fi
+  status_cid="$(post_status_comment "$repo" "$pr" "$reviewer" "$mprovider" "$mname" "$meffort" "$head_sha")"
+  [ -n "$status_cid" ] || log "WARNING: could not post status comment on $repo#$pr"
+
   # write the custom prompt verbatim (avoids bash re-expanding $ / backticks inside it)
   local CP_FILE="$STATE_DIR/custom-prompt-$(echo "$repo" | tr '/' '-').txt"
   printf '%s\n' "$custom_prompt" > "$CP_FILE"
@@ -295,7 +337,11 @@ Do the review from the worktree:
    git --git-dir="$mirror" worktree remove --force "$wt" 2>/dev/null || true
    git --git-dir="$mirror" worktree prune 2>/dev/null || true
 
-5. Finish by reporting: what you reviewed, key findings, and the posted review id.
+5. After posting your review, delete the "review in progress" comment from this PR
+   (id: $status_cid) so it does not linger: gh api --method DELETE repos/$repo/issues/comments/$status_cid
+   (If it is already gone or the delete fails, that is fine — the poller retries the cleanup.)
+
+6. Finish by reporting: what you reviewed, key findings, and the posted review id.
 EOF
 
   log "PR #$repo/$pr: launching review session ($reason; model=$mprovider/$mname)"
@@ -305,8 +351,8 @@ EOF
       "$(cat "$PROMPT_FILE")" > "$SESSION_LOG" 2>&1 &
     echo $! > "$STATE_DIR/session-pr-$SAFE_REPO-$pr.pid"
   )
-  mark_handled_pr "$repo" "$pr" "$reason" "$SESSION_LOG" "$head_sha"
-  log "PR #$repo/$pr: session launched (head $head_sha), log: $SESSION_LOG"
+  mark_handled_pr "$repo" "$pr" "$reason" "$SESSION_LOG" "$head_sha" "$status_cid"
+  log "PR #$repo/$pr: session launched (head $head_sha, status comment $status_cid), log: $SESSION_LOG"
 }
 
 # --- main: discover + throttle + launch ---------------------------------------
@@ -325,6 +371,7 @@ main() {
   fi
 
   report_interrupted
+  cleanup_status_comments
 
   declare -A CANDIDATES=()
   while IFS= read -r repo; do
