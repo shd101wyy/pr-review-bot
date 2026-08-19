@@ -56,38 +56,52 @@ fi
 log "findings=$total blocking=$blocking unsure=$unsure -> event=$event"
 
 # --- build the review payload -------------------------------------------------
+# GitHub rejects REQUEST_CHANGES / COMMENT with an empty body, so a missing
+# summary must not be able to sink the whole review.
+NOBODY='_Automated review: the agent produced findings but no summary._'
 PAYLOAD="${FINDINGS_FILE%.json}-payload.json"
-jq --arg event "$event" --arg sha "$HEAD_SHA" '
+jq --arg event "$event" --arg sha "$HEAD_SHA" --arg nobody "$NOBODY" '
   def inline: ((.path // "") != "") and (((.line // 0) | tonumber? // 0) > 0);
+  def nonblank: if (. | gsub("\\s"; "")) == "" then $nobody else . end;
   {
     event: $event,
     commit_id: $sha,
     comments: [ .findings[]? | select(inline)
                 | {path: .path, line: (.line | tonumber), body: (.body // "")} ],
-    body: ( (.summary // "")
-            + ( [ .findings[]? | select(inline | not) | "- " + (.body // "") ]
-                | if length > 0 then "\n\n### Additional notes\n" + join("\n") else "" end ) )
+    body: ( ( (.summary // "")
+              + ( [ .findings[]? | select(inline | not) | "- " + (.body // "") ]
+                  | if length > 0 then "\n\n### Additional notes\n" + join("\n") else "" end ) )
+            | nonblank )
   }' "$FINDINGS_FILE" > "$PAYLOAD" || die "cannot-build-payload"
 
-post() { "$GH" api "repos/$REPO/pulls/$PR/reviews" --input "$1" -q .id 2>&1; }
+POST_ERR="${FINDINGS_FILE%.json}-post-err.txt"
+# stdout carries the id and NOTHING else: gh can emit warnings on stderr while
+# succeeding, and treating those as a rejection posted a duplicate review.
+post() {
+  : > "$POST_ERR"
+  "$GH" api "repos/$REPO/pulls/$PR/reviews" --input "$1" -q .id 2>"$POST_ERR" | tr -d '[:space:]'
+}
+post_err() { [ -s "$POST_ERR" ] && head -c 300 "$POST_ERR" || echo "(no stderr)"; }
 
 review_id="$(post "$PAYLOAD")"
 if ! [[ "$review_id" =~ ^[0-9]+$ ]]; then
   # Most often an inline comment points at a line outside the diff hunk, which
   # makes GitHub reject the whole review. Fold every finding into the body and
   # retry, so a bad line number costs formatting rather than the whole review.
-  log "WARNING: review rejected ($review_id) — retrying with all findings folded into the body"
+  log "WARNING: review rejected (id='$review_id' err=$(post_err)) — retrying with all findings folded into the body"
   FALLBACK="${FINDINGS_FILE%.json}-payload-fallback.json"
-  jq --arg event "$event" --arg sha "$HEAD_SHA" '
+  jq --arg event "$event" --arg sha "$HEAD_SHA" --arg nobody "$NOBODY" '
+    def nonblank: if (. | gsub("\\s"; "")) == "" then $nobody else . end;
     {
       event: $event,
       commit_id: $sha,
-      body: ( (.summary // "")
-              + ( [ .findings[]? | "- " + (if (.path // "") != "" then "`" + .path + (if (.line // 0) > 0 then ":" + (.line|tostring) else "" end) + "` — " else "" end) + (.body // "") ]
-                  | if length > 0 then "\n\n### Findings\n" + join("\n") else "" end ) )
+      body: ( ( (.summary // "")
+                + ( [ .findings[]? | "- " + (if (.path // "") != "" then "`" + .path + (if (.line // 0) > 0 then ":" + (.line|tostring) else "" end) + "` — " else "" end) + (.body // "") ]
+                    | if length > 0 then "\n\n### Findings\n" + join("\n") else "" end ) )
+              | nonblank )
     }' "$FINDINGS_FILE" > "$FALLBACK"
   review_id="$(post "$FALLBACK")"
-  [[ "$review_id" =~ ^[0-9]+$ ]] || die "post-rejected($review_id)"
+  [[ "$review_id" =~ ^[0-9]+$ ]] || die "post-rejected(err=$(post_err))"
 fi
 log "posted review id=$review_id event=$event on $REPO#$PR @ ${HEAD_SHA:0:7}"
 
@@ -97,6 +111,9 @@ if [ -n "${STATUS_CID:-}" ]; then
     && log "deleted 'reviewing in progress' comment $STATUS_CID" \
     || log "could not delete status comment $STATUS_CID (already gone?)"
 fi
+# Derived files are noise once the review is posted; findings.json stays for
+# debugging (it is the agent's actual output and worktrees/ is gitignored).
+rm -f "$PAYLOAD" "${FINDINGS_FILE%.json}-payload-fallback.json" "$POST_ERR"
 if [ -n "${WT:-}" ] && [ -n "${MIRROR:-}" ]; then
   git --git-dir="$MIRROR" worktree remove --force "$WT" >/dev/null 2>&1
   git --git-dir="$MIRROR" worktree prune >/dev/null 2>&1
