@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # poll.sh — poll the repos in config.json for PRs needing review and auto-launch
-# a DSH headless review session per new PR (git-worktree based).
+# a headless review session per new PR (git-worktree based). The agent harness is
+# config-driven: "dsh" (DeepSeek Harness) or "claude" (Claude Code, headless -p).
 # Top-level config.json is the global config; each "repos[]" entry may override
-# reviewer / model / custom_prompt. Also the single source of bot logic shared
-# by run-now.sh and status.sh.
+# harness / reviewer / model / custom_prompt. Also the single source of bot logic
+# shared by run-now.sh and status.sh.
 set -uo pipefail
 
 # --- self-locating bot dir (safe to move the whole folder anywhere) ---------
@@ -29,6 +30,7 @@ if [ -z "${DSH_BIN:-}" ]; then
   done
   [ -n "${DSH_BIN:-}" ] || DSH_BIN="$(command -v dsh 2>/dev/null || true)"
 fi
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 export PATH="$(dirname "$GH"):/usr/bin:/bin:$PATH"
 
 log() { echo "[$(date -Is)] $*"; }
@@ -40,11 +42,13 @@ load_config() {
   POLL_INTERVAL_MINUTES="$(jq -r '.poll_interval_minutes // 5' "$CONFIG_FILE")"
   MAX_SESSIONS_PER_POLL="$(jq -r '.max_sessions_per_poll // 2' "$CONFIG_FILE")"
   MENTION_WINDOW_HOURS="$(jq -r '.mention_window_hours // 24' "$CONFIG_FILE")"
+  HARNESS="$(jq -r '.harness // "dsh"' "$CONFIG_FILE")"
   MODEL_PROVIDER="$(jq -r '.model.provider // ""' "$CONFIG_FILE")"
   MODEL_NAME="$(jq -r '.model.model // ""' "$CONFIG_FILE")"
   MODEL_EFFORT="$(jq -r '.model.reasoningEffort // ""' "$CONFIG_FILE")"
   CUSTOM_PROMPT="$(jq -r '.custom_prompt // ""' "$CONFIG_FILE")"
   TOKEN_ENV="$(jq -r '.gh.token_env // ""' "$CONFIG_FILE")"
+  TOKEN_LITERAL="$(jq -r '.gh.token // ""' "$CONFIG_FILE")"
   GITHUB_BASE_URL="$(jq -r '.gh.base_url // "https://github.com"' "$CONFIG_FILE")"
   local git_dir worktree_base
   git_dir="$(jq -r '.git_dir // "git"' "$CONFIG_FILE")"
@@ -57,6 +61,7 @@ load_config() {
     {
       repo: ($r.repo // ""),
       reviewer: ($r.reviewer // $root.reviewer // ""),
+      harness: ($r.harness // $root.harness // "dsh"),
       model: {
         provider: ($r.model.provider // $root.model.provider // ""),
         model: ($r.model.model // $root.model.model // ""),
@@ -68,23 +73,32 @@ load_config() {
     || { log "FATAL: cannot compute effective config"; exit 1; }
 }
 
+# state/ and logs/ must exist before load_config writes effective.json into them;
+# GIT_DIR / WORKTREE_BASE are only known after the config is read.
+mkdir -p "$STATE_DIR" "$LOG_DIR"
 load_config
-mkdir -p "$STATE_DIR" "$LOG_DIR" "$GIT_DIR" "$WORKTREE_BASE"
+mkdir -p "$GIT_DIR" "$WORKTREE_BASE"
 
 # --- GitHub credentials for BOTH gh and git -----------------------------------
-GITHUB_TOKEN=""
+GITHUB_TOKEN=""; TOKEN_SRC=""
 if [ -n "$TOKEN_ENV" ]; then
   GITHUB_TOKEN="${!TOKEN_ENV:-}"
-  [ -n "$GITHUB_TOKEN" ] || log "WARNING: $TOKEN_ENV (config gh.token_env) is unset; falling back to gh auth token"
+  if [ -n "$GITHUB_TOKEN" ]; then TOKEN_SRC="env $TOKEN_ENV"
+  else log "WARNING: $TOKEN_ENV (config gh.token_env) is unset; falling back"; fi
 fi
-[ -n "$GITHUB_TOKEN" ] || GITHUB_TOKEN="$("$GH" auth token 2>/dev/null || true)"
+if [ -z "$GITHUB_TOKEN" ] && [ -n "$TOKEN_LITERAL" ]; then
+  GITHUB_TOKEN="$TOKEN_LITERAL"; TOKEN_SRC="config gh.token"
+fi
+if [ -z "$GITHUB_TOKEN" ]; then
+  GITHUB_TOKEN="$("$GH" auth token 2>/dev/null || true)"; TOKEN_SRC="gh keyring"
+fi
 if [ -n "$GITHUB_TOKEN" ]; then
   export GITHUB_TOKEN
   TOKEN_B64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)"
   export GIT_CONFIG_COUNT=1
   export GIT_CONFIG_KEY_0="http.${GITHUB_BASE_URL%/}/.extraheader"
   export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $TOKEN_B64"
-  log "token injected for gh + git (source: ${TOKEN_ENV:-keyring})"
+  log "token injected for gh + git (source: $TOKEN_SRC)"
 else
   log "WARNING: no GitHub token — private repos will fail"
 fi
@@ -92,7 +106,11 @@ fi
 # --- single-instance lock (skipped when sourced by status.sh) ------------------
 if [ "${SKIP_LOCK:-0}" != "1" ]; then
   exec 9>"$LOCK_FILE"
-  flock -n 9 || { log "another poll is running, skip"; exit 0; }
+  if [ -n "${LOCK_WAIT:-}" ]; then
+    flock -w "$LOCK_WAIT" 9 || { log "poll lock still busy after ${LOCK_WAIT}s, skip"; exit 0; }
+  else
+    flock -n 9 || { log "another poll is running, skip"; exit 0; }
+  fi
 fi
 
 # --- state helpers ------------------------------------------------------------
@@ -129,11 +147,14 @@ reviewed_by() {  # $3's latest live (non-dismissed) review commit_id on repo $1 
     -q '.[] | select(.user.login == "'"$3"'") | select(.state != "DISMISSED") | .commit_id' 2>/dev/null | tail -1
 }
 
+# Human-readable name of a harness id, for PR comments and status output.
+harness_label() { case "$1" in claude) echo "Claude Code";; dsh|"") echo "DeepSeek Harness";; *) echo "$1";; esac; }
+
 # Post a "review in progress" comment on the PR; prints the new comment id.
-post_status_comment() {  # repo pr reviewer provider model effort head_sha
-  local repo="$1" pr="$2" reviewer="$3" mprovider="$4" mname="$5" meffort="$6" sha="$7"
+post_status_comment() {  # repo pr reviewer harness provider model effort head_sha
+  local repo="$1" pr="$2" reviewer="$3" harness="$4" mprovider="$5" mname="$6" meffort="$7" sha="$8"
   local body
-  body="@$reviewer is now reviewing this PR using DeepSeek Harness — $mprovider/$mname${meffort:+ (reasoning effort $meffort)}. Target HEAD commit: https://github.com/$repo/commit/$sha (\`${sha:0:7}\`)."
+  body="@$reviewer is now reviewing this PR using $(harness_label "$harness") — ${mprovider:+$mprovider/}$mname${meffort:+ (reasoning effort $meffort)}. Target HEAD commit: ${GITHUB_BASE_URL%/}/$repo/commit/$sha (\`${sha:0:7}\`)."
   "$GH" api --method POST "repos/$repo/issues/$pr/comments" -f "body=$body" -q .id 2>/dev/null || echo ""
 }
 
@@ -225,7 +246,7 @@ discover() {
     || date -u -v-${MENTION_WINDOW_HOURS}H +%Y-%m-%dT%H:%M:%SZ)"
   mapfile -t MENT < <(
     "$GH" api "repos/$repo/issues/comments?since=$SINCE&per_page=100" --paginate \
-      -q '.[] | select(.user.login != "'"$reviewer"'") | select(.body | test("@'"$reviewer"'"; "i")) | [.id, (.issue.number // 0)] | @tsv' 2>/dev/null
+      -q '.[] | select(.user.login != "'"$reviewer"'") | select(.body | test("@'"$reviewer"'"; "i")) | [.id, (.issue_url | split("/") | last)] | @tsv' 2>/dev/null
   ) || true
   for row in "${MENT[@]+"${MENT[@]}"}"; do
     [ -n "$row" ] || continue
@@ -248,13 +269,14 @@ launch_review() {
   local SESSION_LOG="$LOG_DIR/session-pr-$pr-$(date +%Y%m%d-%H%M%S).log"
   local PROMPT_FILE="$LOG_DIR/prompt-$SAFE_REPO-$pr.txt"
   local MODEL_PATCH="$STATE_DIR/model-patch-$SAFE_REPO.yml"
-  local pair base_ref head_sha reviewer custom_prompt
+  local pair base_ref head_sha reviewer custom_prompt harness
   local mprovider mname meffort
   local entry
 
   entry="$(eff_repo "$repo")"
   [ -n "$entry" ] || { log "FATAL: repo $repo not found in effective config"; return 1; }
   reviewer="$(jq -r '.reviewer' <<<"$entry")"
+  harness="$(jq -r '.harness // "dsh"' <<<"$entry")"
   custom_prompt="$(jq -r '.custom_prompt' <<<"$entry")"
   mprovider="$(jq -r '.model.provider' <<<"$entry")"
   mname="$(jq -r '.model.model' <<<"$entry")"
@@ -264,15 +286,29 @@ launch_review() {
   base_ref="${pair%%$'\t'*}"; [ -n "$base_ref" ] || base_ref="main"
   head_sha="${pair##*$'\t'}"
 
-  # per-repo model patch
-  {
-    echo "# generated from config.json (effective model for $repo)"
-    echo "- id: agent-default-model"
-    echo "  config:"
-    printf '    provider: %s\n' "$mprovider"
-    printf '    model: %s\n' "$mname"
-    [ -n "$meffort" ] && printf '    reasoningEffort: %s\n' "$meffort"
-  } > "$MODEL_PATCH"
+  # --- per-harness preflight: fail before touching the PR ----------------------
+  case "$harness" in
+    dsh)
+      [ -n "${DSH_BIN:-}" ] && [ -x "$NODE" ] || { log "FATAL: harness dsh needs NODE + DSH_BIN (node=$NODE dsh=${DSH_BIN:-unset})"; return 1; }
+      # per-repo model patch (dsh selects its model through this patch layer)
+      {
+        echo "# generated from config.json (effective model for $repo)"
+        echo "- id: agent-default-model"
+        echo "  config:"
+        printf '    provider: %s\n' "$mprovider"
+        printf '    model: %s\n' "$mname"
+        [ -n "$meffort" ] && printf '    reasoningEffort: %s\n' "$meffort"
+      } > "$MODEL_PATCH"
+      ;;
+    claude)
+      [ -x "$CLAUDE_BIN" ] || { log "FATAL: harness claude: no executable claude at $CLAUDE_BIN (set CLAUDE_BIN)"; return 1; }
+      case "$meffort" in
+        ""|low|medium|high|xhigh|max) ;;
+        *) log "WARNING: reasoningEffort '$meffort' is not a claude --effort level; ignoring"; meffort="";;
+      esac
+      ;;
+    *) log "FATAL: unknown harness '$harness' for $repo (expected dsh or claude)"; return 1;;
+  esac
 
   # manage the "review in progress" status comment on the PR
   local status_cid old_cid
@@ -281,7 +317,7 @@ launch_review() {
   if [ -n "$old_cid" ]; then
     "$GH" api --method DELETE "repos/$repo/issues/comments/$old_cid" >/dev/null 2>&1 || true
   fi
-  status_cid="$(post_status_comment "$repo" "$pr" "$reviewer" "$mprovider" "$mname" "$meffort" "$head_sha")"
+  status_cid="$(post_status_comment "$repo" "$pr" "$reviewer" "$harness" "$mprovider" "$mname" "$meffort" "$head_sha")"
   [ -n "$status_cid" ] || log "WARNING: could not post status comment on $repo#$pr"
 
   # write the custom prompt verbatim (avoids bash re-expanding $ / backticks inside it)
@@ -343,11 +379,25 @@ Do the review from the worktree:
 6. Finish by reporting: what you reviewed, key findings, and the posted review id.
 EOF
 
-  log "PR #$repo/$pr: launching review session ($reason; model=$mprovider/$mname)"
+  # claude reads the prompt on stdin (no argv size limit) and needs the mirror /
+  # worktree trees allow-listed because they live outside its cwd.
+  local -a cargs=(-p --permission-mode bypassPermissions --output-format json
+                  --add-dir "$GIT_DIR" --add-dir "$WORKTREE_BASE")
+  [ -n "$mname" ] && cargs+=(--model "$mname")
+  [ -n "$meffort" ] && cargs+=(--effort "$meffort")
+
+  log "PR #$repo/$pr: launching review session ($reason; harness=$harness, model=${mprovider:+$mprovider/}$mname)"
   (
     cd "$BOT_DIR"
-    nohup "$NODE" --expose-internals "$DSH_BIN" --profile headless --patch "$MODEL_PATCH" \
-      "$(cat "$PROMPT_FILE")" > "$SESSION_LOG" 2>&1 &
+    case "$harness" in
+      claude)
+        nohup "$CLAUDE_BIN" "${cargs[@]}" < "$PROMPT_FILE" > "$SESSION_LOG" 2>&1 &
+        ;;
+      *)
+        nohup "$NODE" --expose-internals "$DSH_BIN" --profile headless --patch "$MODEL_PATCH" \
+          "$(cat "$PROMPT_FILE")" > "$SESSION_LOG" 2>&1 &
+        ;;
+    esac
     echo $! > "$STATE_DIR/session-pr-$SAFE_REPO-$pr.pid"
   )
   mark_handled_pr "$repo" "$pr" "$reason" "$SESSION_LOG" "$head_sha" "$status_cid"

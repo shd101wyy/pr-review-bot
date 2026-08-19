@@ -3,13 +3,15 @@
   "poll_interval_minutes": 5,
   "max_sessions_per_poll": 2,
   "mention_window_hours": 24,
+  "harness": "claude",
   "model": {
-    "provider": "opencode-go",
-    "model": "deepseek-v4-flash",
-    "reasoningEffort": "max"
+    "provider": "",
+    "model": "opus",
+    "reasoningEffort": "high"
   },
   "gh": {
     "token_env": "",
+    "token": "",
     "base_url": "https://github.com"
   },
   "custom_prompt": "Help audit the code changes, make sure it's correct, safe and secure, KISS and DRY. Please feel free to leave inline comments.",
@@ -21,7 +23,10 @@
       "reviewer": "reviewer-a"
     },
     {
-      "repo": "org/repo-b"
+      "repo": "org/repo-b",
+      "harness": "dsh",
+      "model": { "provider": "opencode-go", "model": "deepseek-v4-flash", "reasoningEffort": "max" },
+      "custom_prompt": "Focus on security and error handling."
     }
   ]
 }

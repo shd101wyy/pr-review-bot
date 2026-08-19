@@ -13,8 +13,9 @@ secs_ago() { local n d; n=$(date +%s); d=$((n - $1)); if [ "$d" -lt 60 ]; then e
 echo "=== PR review bot status ==="
 echo "Config  : $CONFIG_FILE"
 echo "Repos   :"
-jq -r '.repos[] | "    \(.repo)  (reviewer: \(.reviewer) | model: \(.model.provider)/\(.model.model)\(.model.reasoningEffort // "" | if . != "" then " (" + . + ")" else "" end))"' "$EFFECTIVE_FILE" 2>/dev/null | sed -n '1,20p'
-echo "Model (global default): $MODEL_PROVIDER / $MODEL_NAME${MODEL_EFFORT:+ / effort=$MODEL_EFFORT}"
+jq -r '.repos[] | "    \(.repo)  (reviewer: \(.reviewer) | harness: \(.harness) | model: \(.model.provider | if . != "" then . + "/" else "" end)\(.model.model)\(.model.reasoningEffort // "" | if . != "" then " (" + . + ")" else "" end))"' "$EFFECTIVE_FILE" 2>/dev/null | sed -n '1,20p'
+echo "Harness (global default): $HARNESS ($(harness_label "$HARNESS"))"
+echo "Model   (global default): ${MODEL_PROVIDER:+$MODEL_PROVIDER / }$MODEL_NAME${MODEL_EFFORT:+ / effort=$MODEL_EFFORT}"
 
 echo
 echo "--- scheduler ---"
@@ -40,12 +41,17 @@ while IFS=$'\t' read -r key reason ts slog; do
       state="RUNNING"
       tail1="$(tail -1 "$slog" 2>/dev/null | head -c 90)"
     else
-      if grep -qE 'Error:|at file://|FATAL|MISSING_CREDENTIAL' "$slog" 2>/dev/null; then
+      if jq -e 'type == "object"' "$slog" >/dev/null 2>&1; then
+        # claude -p --output-format json: one object carrying is_error / result
+        [ "$(jq -r '.is_error // false' "$slog" 2>/dev/null)" = "true" ] && state="FAILED" || state="finished"
+        tail1="$(jq -r '.result // .stop_reason // ""' "$slog" 2>/dev/null | head -1 | head -c 90)"
+      elif grep -qE 'Error:|at file://|FATAL|MISSING_CREDENTIAL' "$slog" 2>/dev/null; then
         state="FAILED"
+        tail1="$(tail -2 "$slog" 2>/dev/null | head -1 | head -c 90)"
       else
         state="finished"
+        tail1="$(tail -2 "$slog" 2>/dev/null | head -1 | head -c 90)"
       fi
-      tail1="$(tail -2 "$slog" 2>/dev/null | head -1 | head -c 90)"
     fi
   elif [ "$reason" = "already_reviewed" ]; then
     state="skipped(already reviewed)"; tail1=""
@@ -82,7 +88,7 @@ for k in $(printf '%s\n' "${!PENDING[@]}" | sort); do
 done
 echo
 echo "View a session: tail -f $(echo "$LOG_DIR" | sed 's|'"$BOT_DIR"'/||')/session-pr-<n>-<ts>.log"
-echo "Note: headless sessions run as separate processes and are NOT listed in the DSH web GUI"
-echo "      (the GUI only shows sessions created inside dsh web). The log stays empty while a"
-echo "      session is working and is written when it finishes."
+echo "Note: headless sessions run as separate processes, so they are NOT listed in the DSH web GUI"
+echo "      (it only shows sessions created inside dsh web) nor in \`claude agents\`. A dsh log stays"
+echo "      empty until the session finishes; a claude log is one JSON object written at the end."
 echo "Logs: $LOG_DIR"

@@ -16,22 +16,27 @@ case "${1:-}" in
 esac
 
 # tool paths / HOME are resolved dynamically by poll.sh (source below)
+if [ $# -gt 0 ]; then
+  SKIP_LOCK=1          # manual single-PR review: only launches, never discovers
+else
+  LOCK_WAIT=60         # forced poll: wait for an in-flight poll instead of skipping
+fi
 
 # shellcheck disable=SC1091
-. "$BOT_DIR/poll.sh"   # loads config + helpers; sourcing acquires the lock (fine)
+. "$BOT_DIR/poll.sh"   # loads config + helpers
 
 if [ $# -eq 0 ]; then
   FORCE=1 main
   exit 0
 fi
 
-repo="${REPOS[0]}"; pr=""
+repo="$(jq -r '.repos[0].repo // ""' "$EFFECTIVE_FILE")"; pr=""
 case "$1" in
   */*) repo="$1"; pr="${2:-}";;
   *)   pr="$1";;
 esac
 [ -z "$pr" ] && { echo "usage: $0 [owner/repo] <PR number>"; exit 2; }
-echo "$repo" | grep -q '/' || repo="${REPOS[0]}"
+[ -n "$repo" ] || { echo "no repo given and config.repos is empty"; exit 2; }
 
 echo ">> Manually reviewing PR #$pr in $repo"
 launch_review "$repo" "$pr" "manual"

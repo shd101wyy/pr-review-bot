@@ -1,7 +1,8 @@
-# PR Review Bot（DSH headless）
+# PR Review Bot（headless agent）
 
-自动监听 GitHub 仓库中请求指定 reviewer 审查的 PR，用 DSH headless session 以你配置的
-模型（provider + model + reasoningEffort）完成代码审查，并通过 GitHub API 把 review
+自动监听 GitHub 仓库中请求指定 reviewer 审查的 PR，启动一个 headless agent session 以你配置的
+模型完成代码审查。**agent harness 可配置**：`dsh`（DeepSeek Harness）或 `claude`（Claude Code
+的 `claude -p` 无头模式），可全局设定，也可按仓库分别指定，并通过 GitHub API 把 review
 （含 inline comments）贴回 PR。审查基于 **git worktree**——同一时间多个 PR 可并行 review，
 互不干扰。
 
@@ -32,13 +33,15 @@ pr-review-bot/
   "poll_interval_minutes": 5,           // 轮询频率（timer 每分钟唤醒，脚本按此节流）
   "max_sessions_per_poll": 2,           // 每轮最多新开几个 review session
   "mention_window_hours": 24,           // 只关注最近 N 小时内的 @mention 评论
+  "harness": "claude",                  // 全局默认 harness："claude" 或 "dsh"
   "model": {                            // 全局默认模型
-    "provider": "opencode-go",
-    "model": "deepseek-v4-flash",
-    "reasoningEffort": "max"
+    "provider": "",                     // claude 忽略此字段，留空即可；dsh 必填
+    "model": "opus",                    // claude：别名或完整 id；dsh：provider 下的模型名
+    "reasoningEffort": "high"
   },
   "gh": {
-    "token_env": "",                    // 可选：读哪个环境变量作为 GitHub token（留空=用 gh keyring）
+    "token_env": "",                    // 可选：读哪个环境变量作为 GitHub token
+    "token": "",                        // 可选：直接写 token（优先级：token_env > token > gh keyring）
     "base_url": "https://github.com"    // GitHub Enterprise 可改
   },
   "custom_prompt": "<全局默认审查指令>",
@@ -47,17 +50,52 @@ pr-review-bot/
   "repos": [
     { "repo": "org/repo-a", "reviewer": "reviewer-a" },          // 只覆盖 reviewer
     { "repo": "org/repo-b",                                        // 其余全部用全局默认
+      "harness": "dsh",                                            // 这个仓库改用 DeepSeek Harness
       "model": { "provider": "opencode-go", "model": "deepseek-v4-flash", "reasoningEffort": "max" },
-      "custom_prompt": "Focus on security..." }                    // 仓库级模型与审查指令
+      "custom_prompt": "Focus on security..." }                    // 仓库级 harness / 模型 / 审查指令
   ]
 }
 ```
 
-> 可覆盖的字段：`reviewer`、`model.provider`、`model.model`、`model.reasoningEffort`、`custom_prompt`。
+> 可覆盖的字段：`harness`、`reviewer`、`model.provider`、`model.model`、`model.reasoningEffort`、`custom_prompt`。
 
 > `config.json` 位于本目录，而本目录不在任何 git 仓库内，因此不会被提交；目录内 `.gitignore`
 > 也把 `config.json`、`state/`、`logs/`、`git/`、`worktrees/` 都忽略了，即使整个目录将来被
 > 纳入版本控制也安全。
+
+## Harness（dsh / claude）
+
+`harness` 决定用哪个 agent 跑这次 review。两者读的是同一份 prompt、同一套 worktree 流程，
+只是启动方式与模型字段的含义不同：
+
+| | `dsh`（默认） | `claude` |
+|---|---|---|
+| 启动 | `node --expose-internals <dsh bin.js> --profile headless --patch <model-patch>` | `claude -p --permission-mode bypassPermissions --output-format json` |
+| prompt 传递 | 命令行位置参数 | stdin（不受命令行长度限制） |
+| `model.provider` | 必填，写进 `state/model-patch-<repo>.yml` | **忽略，请留空** |
+| `model.model` | provider 下的模型名，如 `deepseek-v4-flash` | `--model` 的值：别名（`opus` / `sonnet` / `fable`）或完整 id |
+| `model.reasoningEffort` | 写进 model patch | `--effort`，仅接受 `low` / `medium` / `high` / `xhigh` / `max`（其它值会告警并忽略） |
+| 可执行文件 | `NODE` + `DSH_BIN` | `CLAUDE_BIN`（默认自动探测 `command -v claude`） |
+| session 日志 | 纯文本，结束时一次性写入 | 单个 JSON 对象（含 `is_error` / `result` / `session_id` / `usage`） |
+
+用 `claude` 的前置条件：
+
+1. 本机装好 `claude` 并已登录（`claude auth` 或订阅登录均可）——bot 直接复用该登录态，
+   不需要额外配 API key。用 `echo hi | claude -p` 验证一次即可。
+2. review session 是**非交互**的，所以用 `--permission-mode bypassPermissions`，
+   否则 agent 会卡在工具授权确认上。这与 dsh headless 的信任级别一致，但也意味着 agent
+   在读取外部贡献者的 PR 内容时拥有完整工具权限（见下方安全提示）。
+3. mirror 与 worktree 目录在 cwd 之外，已通过 `--add-dir` 显式放行。
+4. `model.provider` 对 claude 无意义，**请留空**：它会出现在 PR 上那条"正在 review"评论里
+   （留空时只显示模型名，不显示 `provider/`）。从 claude 切回 dsh 时记得把 provider 填回去。
+
+> **安全提示**：无论哪个 harness，agent 都在拥有 GitHub 写权限 token 的情况下读取
+> 攻击者可控的 PR 内容（diff、源码、PR 描述），存在 prompt injection 风险。建议把
+> token 换成仅对目标仓库开放 `pull_requests: read/write` 的 fine-grained token，
+> 并考虑把 session 放进容器里跑。
+
+切换后无需改任何脚本，只改 `config.json` 里的 `harness` 字段再跑一次 `./status.sh`
+确认生效（会打印每个仓库的 harness）。
 
 ## 常用操作
 
@@ -72,6 +110,9 @@ pr-review-bot/
 ```bash
 ./run-now.sh
 ```
+
+（若此刻 timer 正在轮询，`./run-now.sh` 会等最多 60s 拿锁，而不是直接放弃；
+手动指定单个 PR 的用法不做发现、不抢锁，随时可用。）
 
 手动 review 某个 PR：
 
@@ -88,9 +129,10 @@ DRY_RUN=1 ./run-now.sh
 
 查看单个 review session 的完整过程：`tail -f logs/session-pr-*.log`
 
-注意：headless review 会话是**独立进程**，不会出现在 DSH Web GUI 的会话列表里
-（GUI 只显示在 `dsh web` 里创建的会话）。review 的最终结果是贴在 GitHub PR 上的
-review；过程日志在 `logs/` 下；会话期间日志文件通常是空的，结束后一次性写入。
+注意：headless review 会话是**独立进程**，既不会出现在 DSH Web GUI 的会话列表里
+（GUI 只显示在 `dsh web` 里创建的会话），也不会出现在 `claude agents` 里。review 的最终
+结果是贴在 GitHub PR 上的 review；过程日志在 `logs/` 下：`dsh` 的日志在会话期间通常是空的、
+结束后一次性写入，`claude` 的日志是结束时写入的单个 JSON 对象。
 
 ## 工作原理
 
@@ -101,7 +143,7 @@ review；过程日志在 `logs/` 下；会话期间日志文件通常是空的�
    PR head 出现了新 commit，或之前的 review 已被 dismiss；否则跳过。
    **review 进行中若 PR 出现新 commit，poller 会立即终止进行中的 session，并在同一轮
    为新 commit 重新开启 review**（发现延迟 ≤ poll_interval_minutes，可调小以获得更快的响应）。
-3. **审查**：每个新 PR 启动一个 DSH headless session，prompt 指引 agent：
+3. **审查**：每个新 PR 启动一个 headless session（harness 见上文），prompt 指引 agent：
    在对应仓库的 git worktree 里拉取该 PR 的 head，`git diff` 对比 base 分支，逐文件阅读，
    按 custom prompt 审计，最后用 `gh api .../pulls/N/reviews` 一次性提交 review
    （inline comments 优先）。结果判定：**没有 blocking 问题就 APPROVE**（所有建议/小问题一律
@@ -165,6 +207,9 @@ systemctl --user start pr-review-bot.service   # 或 ./run-now.sh
   被中断的 session。已正常完成的 review 会顺带清理，不会误报。
 - 私有仓库 clone/fetch 失败 → 确认 `gh auth status` 有 token；或在配置 `gh.token_env`
   指向一个含 GitHub token 的环境变量（例如在 systemd unit 或 shell 中 export）。
-- 模型不对 → 检查 `state/model-patch-<repo>.yml`，它由合并后的 effective 配置生成。
-- 机器上找不到 gh/node/DSH → 显式设置 `GH`、`NODE`、`DSH_BIN` 环境变量后重跑。
+- 模型不对 → `dsh` 检查 `state/model-patch-<repo>.yml`（由合并后的 effective 配置生成）；
+  `claude` 直接看 `poll.log` 里 launching 那行的 `harness=` / `model=`，或 session 日志 JSON 的 `modelUsage`。
+- 机器上找不到 gh/node/DSH/claude → 显式设置 `GH`、`NODE`、`DSH_BIN`、`CLAUDE_BIN` 环境变量后重跑。
+- `harness` 写错（既不是 `dsh` 也不是 `claude`）→ 该 PR 会在**发出任何 PR 评论之前**被跳过，
+  `poll.log` 打印 `FATAL: unknown harness`。
 - session 失败 → 查看对应 `logs/session-pr-*.log` 尾部报错。
