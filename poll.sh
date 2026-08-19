@@ -14,6 +14,7 @@ STATE_DIR="$BOT_DIR/state"
 LOG_DIR="$BOT_DIR/logs"
 STATE_FILE="$STATE_DIR/state.json"
 LOCK_FILE="$STATE_DIR/poll.lock"
+STATE_LOCK="$STATE_DIR/state.lock"
 LAST_POLL_FILE="$STATE_DIR/last_poll"
 EFFECTIVE_FILE="$STATE_DIR/effective.json"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -30,7 +31,10 @@ if [ -z "${DSH_BIN:-}" ]; then
   done
   [ -n "${DSH_BIN:-}" ] || DSH_BIN="$(command -v dsh 2>/dev/null || true)"
 fi
-CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
+# claude's binary and profile are resolved after load_config (env > config > PATH).
+CLAUDE_BIN_ENV="${CLAUDE_BIN:-}"
+CLAUDE_CONFIG_DIR_ENV="${CLAUDE_CONFIG_DIR:-}"
+expand_home() { case "$1" in "~") echo "$HOME";; "~/"*) echo "$HOME/${1#\~/}";; *) echo "$1";; esac; }
 export PATH="$(dirname "$GH"):/usr/bin:/bin:$PATH"
 
 log() { echo "[$(date -Is)] $*"; }
@@ -41,12 +45,15 @@ load_config() {
   REVIEWER="$(jq -r '.reviewer // ""' "$CONFIG_FILE")"
   POLL_INTERVAL_MINUTES="$(jq -r '.poll_interval_minutes // 5' "$CONFIG_FILE")"
   MAX_SESSIONS_PER_POLL="$(jq -r '.max_sessions_per_poll // 2' "$CONFIG_FILE")"
+  MAX_CONCURRENT_SESSIONS="$(jq -r '.max_concurrent_sessions // 4' "$CONFIG_FILE")"
   MENTION_WINDOW_HOURS="$(jq -r '.mention_window_hours // 24' "$CONFIG_FILE")"
   HARNESS="$(jq -r '.harness // "dsh"' "$CONFIG_FILE")"
   MODEL_PROVIDER="$(jq -r '.model.provider // ""' "$CONFIG_FILE")"
   MODEL_NAME="$(jq -r '.model.model // ""' "$CONFIG_FILE")"
   MODEL_EFFORT="$(jq -r '.model.reasoningEffort // ""' "$CONFIG_FILE")"
   CUSTOM_PROMPT="$(jq -r '.custom_prompt // ""' "$CONFIG_FILE")"
+  CLAUDE_CFG_BIN="$(jq -r '.claude.bin // ""' "$CONFIG_FILE")"
+  CLAUDE_CFG_DIR="$(jq -r '.claude.config_dir // ""' "$CONFIG_FILE")"
   TOKEN_ENV="$(jq -r '.gh.token_env // ""' "$CONFIG_FILE")"
   TOKEN_LITERAL="$(jq -r '.gh.token // ""' "$CONFIG_FILE")"
   GITHUB_BASE_URL="$(jq -r '.gh.base_url // "https://github.com"' "$CONFIG_FILE")"
@@ -78,6 +85,34 @@ load_config() {
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 load_config
 mkdir -p "$GIT_DIR" "$WORKTREE_BASE"
+
+# --- resolve the claude binary + profile (env > config.json > PATH) ------------
+# Wrappers like `claude-sk` are usually shell ALIASES of the form
+#   alias claude-sk='CLAUDE_CONFIG_DIR="$HOME/.claude-sk" claude'
+# An alias cannot be exec'd from a script and systemd exports no shell aliases, so
+# the profile has to travel explicitly as CLAUDE_CONFIG_DIR. Point claude.config_dir
+# at the profile that is actually logged in — the default ~/.claude often is not.
+resolve_claude() {
+  if   [ -n "$CLAUDE_BIN_ENV" ]; then CLAUDE_BIN="$CLAUDE_BIN_ENV"
+  elif [ -n "$CLAUDE_CFG_BIN" ]; then CLAUDE_BIN="$(expand_home "$CLAUDE_CFG_BIN")"
+  else CLAUDE_BIN="$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")"
+  fi
+  # A bare name (no slash) may be an alias or a PATH entry: resolve it to a real path.
+  case "$CLAUDE_BIN" in
+    */*) ;;
+    *)   CLAUDE_BIN="$(command -v "$CLAUDE_BIN" 2>/dev/null || echo "$CLAUDE_BIN")";;
+  esac
+  if   [ -n "$CLAUDE_CONFIG_DIR_ENV" ]; then CLAUDE_CONFIG_DIR_EFF="$CLAUDE_CONFIG_DIR_ENV"
+  elif [ -n "$CLAUDE_CFG_DIR" ];        then CLAUDE_CONFIG_DIR_EFF="$(expand_home "$CLAUDE_CFG_DIR")"
+  else CLAUDE_CONFIG_DIR_EFF=""   # leave claude to its own default
+  fi
+}
+resolve_claude
+# claude.bin / claude.config_dir are machine-level, not per-repo: a repo entry
+# carrying them would be silently ignored, so say so instead.
+if jq -e '[.repos[]? | select(has("claude"))] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+  log "WARNING: a repos[] entry sets \"claude\" — that block is global only and is being ignored (move it to the top level)"
+fi
 
 # --- GitHub credentials for BOTH gh and git -----------------------------------
 GITHUB_TOKEN=""; TOKEN_SRC=""
@@ -118,23 +153,114 @@ fi
 KEY() { echo "$1#$2"; }
 handled_pr() { jq -e --arg k "$(KEY "$1" "$2")" '.handled_prs[$k] != null' "$STATE_FILE" >/dev/null 2>&1; }
 handled_comment() { jq -e --arg c "$1" '.handled_comments[$c] != null' "$STATE_FILE" >/dev/null 2>&1; }
-save_state() { mv "$STATE_FILE.tmp" "$STATE_FILE"; }
+
+# Every state write is a read-modify-write, and a poll, a manual run-now and a
+# status.sh can overlap; an unsynchronised `jq > tmp && mv` silently drops one
+# side's entry. This lock is separate from the poll lock so a manual single-PR
+# review still serialises its writes without blocking on discovery.
+state_update() {  # jq-filter [jq-args...]
+  local filter="$1"; shift
+  ( flock 7
+    jq "$@" "$filter" "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  ) 7>"$STATE_LOCK"
+}
 mark_handled_pr() {
-  local key pr reason log head_sha status_comment
-  key="$(KEY "$1" "$2")"; pr="$2"; reason="$3"; log="$4"; head_sha="${5:-}"; status_comment="${6:-}"
-  jq --arg k "$key" --arg p "$pr" --arg r "$reason" --arg l "$log" --arg t "$NOW_ISO" --arg h "$head_sha" --arg sc "$status_comment" \
-    '.handled_prs[$k] = {pr: $p, triggered_at: $t, reason: $r, session_log: $l, head_sha: $h, status_comment: $sc}' \
-    "$STATE_FILE" > "$STATE_FILE.tmp" && save_state
+  local key="$(KEY "$1" "$2")"
+  state_update '.handled_prs[$k] = {pr: $p, triggered_at: $t, reason: $r, session_log: $l, head_sha: $h, status_comment: $sc}' \
+    --arg k "$key" --arg p "$2" --arg r "$3" --arg l "$4" --arg t "$NOW_ISO" --arg h "${5:-}" --arg sc "${6:-}"
 }
 clear_status_comment() {
-  local key="$1"
-  jq --arg k "$key" 'del(.handled_prs[$k].status_comment)' "$STATE_FILE" > "$STATE_FILE.tmp" && save_state
+  state_update 'del(.handled_prs[$k].status_comment)' --arg k "$1"
 }
 mark_handled_comment() {
-  local cid="$1" pr="$2" repo="$3"
-  jq --arg c "$cid" --arg p "$pr" --arg r "$repo" --arg t "$NOW_ISO" \
-    '.handled_comments[$c] = {repo: $r, pr: $p, seen_at: $t}' \
-    "$STATE_FILE" > "$STATE_FILE.tmp" && save_state
+  state_update '.handled_comments[$c] = {repo: $r, pr: $p, seen_at: $t}' \
+    --arg c "$1" --arg p "$2" --arg r "$3" --arg t "$NOW_ISO"
+}
+# Mentions older than twice the window can never come back from the `since`
+# filter, so their dedup entries are dead weight.
+prune_handled_comments() {
+  local cutoff
+  cutoff="$(date -u -d "-$((MENTION_WINDOW_HOURS * 2)) hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -v-$((MENTION_WINDOW_HOURS * 2))H +%Y-%m-%dT%H:%M:%SZ)"
+  state_update 'if .handled_comments then .handled_comments |= with_entries(select(.value.seen_at >= $c)) else . end' \
+    --arg c "$cutoff"
+}
+
+# --- session pid helpers ------------------------------------------------------
+pidfile_for() { echo "$STATE_DIR/session-pr-$(echo "$1" | tr '/' '-')-$2.pid"; }
+read_pid() {  # prints the pid recorded in $1; drops the file if it is malformed
+  local pid
+  [ -f "$1" ] || return 1
+  pid="$(cat "$1" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) rm -f "$1"; return 1;; esac
+  [ "$pid" -gt 1 ] || { rm -f "$1"; return 1; }
+  echo "$pid"
+}
+pid_alive() { kill -0 "$1" 2>/dev/null; }
+# Only ever drop the pid file of a session that is really gone — deleting a live
+# session's file makes it invisible to status.sh and the interrupted-run report.
+prune_pidfile() {
+  local pid
+  pid="$(read_pid "$1")" || { rm -f "$1"; return 0; }
+  pid_alive "$pid" || rm -f "$1"
+}
+# Kill a session and everything it spawned. Sessions are started with setsid so
+# they own their process group; group-killing is what reaches the git/gh children
+# that would otherwise keep writing the worktree the replacement session reuses.
+kill_session() {  # pid
+  local pid="$1" pgid own i
+  own="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  # Never group-kill our own group: that would take out the poller itself.
+  case "$pgid" in
+    ''|*[!0-9]*) pgid="";;
+    "$own")      pgid="";;
+    1)           pgid="";;
+  esac
+  if [ -n "$pgid" ]; then kill -TERM "-$pgid" 2>/dev/null || true
+  else kill -TERM "$pid" 2>/dev/null || true; fi
+  for i in $(seq 1 25); do
+    pid_alive "$pid" || return 0
+    sleep 0.2
+  done
+  log "session pid $pid ignored SIGTERM, sending SIGKILL"
+  if [ -n "$pgid" ]; then kill -KILL "-$pgid" 2>/dev/null || true
+  else kill -KILL "$pid" 2>/dev/null || true; fi
+}
+count_running_sessions() {
+  local n=0 pf pid
+  for pf in "$STATE_DIR"/session-pr-*.pid; do
+    [ -f "$pf" ] || continue
+    pid="$(read_pid "$pf")" || continue
+    pid_alive "$pid" && n=$((n+1))
+  done
+  echo "$n"
+}
+
+# max_sessions_per_poll bounds how many we START per poll; without this, N polls
+# could stack N x that many concurrent agents on one machine.
+at_session_cap() {  # repo pr -> true (0) when we must not launch now
+  local running
+  running="$(count_running_sessions)"
+  if [ "$running" -ge "$MAX_CONCURRENT_SESSIONS" ]; then
+    log "PR #$1/$2: $running session(s) already running (max_concurrent_sessions=$MAX_CONCURRENT_SESSIONS) — deferring to a later poll"
+    return 0
+  fi
+  return 1
+}
+
+# Classify a session that is no longer running, from its log: failed|finished|empty.
+# claude writes one JSON object (is_error); dsh writes free-form text.
+session_outcome() {  # logfile
+  local slog="$1"
+  [ -n "$slog" ] && [ -s "$slog" ] || { echo empty; return 0; }
+  if jq -e 'type == "object"' "$slog" >/dev/null 2>&1; then
+    [ "$(jq -r '.is_error // false' "$slog" 2>/dev/null)" = "true" ] && echo failed || echo finished
+  elif grep -qE 'Error:|at file://|FATAL|MISSING_CREDENTIAL' "$slog" 2>/dev/null; then
+    echo failed
+  else
+    echo finished
+  fi
 }
 
 # --- per-repo effective config lookup ------------------------------------------
@@ -145,6 +271,19 @@ head_of() { "$GH" api "repos/$1/pulls/$2" -q .head.sha 2>/dev/null || echo ""; }
 reviewed_by() {  # $3's latest live (non-dismissed) review commit_id on repo $1 pr $2; empty = no live review
   "$GH" api "repos/$1/pulls/$2/reviews" --paginate \
     -q '.[] | select(.user.login == "'"$3"'") | select(.state != "DISMISSED") | .commit_id' 2>/dev/null | tail -1
+}
+
+# Open PRs in $1 with a review requested from $2. Paginated: a bare `first: 100`
+# silently capped discovery on busy repos.
+requested_prs() {
+  "$GH" api graphql --paginate \
+    -f query='query($q: String!, $endCursor: String) {
+      search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
+        edges { node { ... on PullRequest { number } } }
+      } }' \
+    -f q="repo:$1 is:pr is:open review-requested:$2" \
+    -q '.data.search.edges[].node.number' 2>/dev/null
 }
 
 # Human-readable name of a harness id, for PR comments and status output.
@@ -179,20 +318,20 @@ cleanup_status_comments() {
   done < <(jq -r '.handled_prs | keys[]' "$STATE_FILE" 2>/dev/null)
 }
 
-# --- report review sessions interrupted by a reboot/crash -----------------------
+# --- report review sessions that ended without posting a review -----------------
 # A session that genuinely finished has a live review by the time the next poll
-# runs, so its stale pid file is just clean-up. A session killed mid-run has no
-# such review yet and is reported as needing a re-review. (Whether a later commit
-# should be re-reviewed at all is the main loop's call, not this report's.)
+# runs, so its stale pid file is just clean-up. Anything else ended early, and the
+# session log says how: a non-empty failure log means the agent itself failed,
+# while an empty/absent log means the process vanished (reboot, OOM, kill).
+# (Whether a later commit should be re-reviewed at all is the main loop's call.)
 report_interrupted() {
-  local n=0 list="" repo pr pidf pid reviewed reviewer
+  local n=0 list="" repo pr pidf pid reviewed reviewer slog outcome why
   while IFS=# read -r repo pr; do
     [ -n "$repo" ] && [ -n "$pr" ] || continue
-    pidf="$STATE_DIR/session-pr-$(echo "$repo" | tr '/' '-')-$pr.pid"
+    pidf="$(pidfile_for "$repo" "$pr")"
     [ -f "$pidf" ] || continue
-    pid="$(cat "$pidf" 2>/dev/null || echo 0)"
-    if [ "$pid" -le 1 ]; then rm -f "$pidf"; continue; fi
-    kill -0 "$pid" 2>/dev/null && continue   # still running — not stale
+    pid="$(read_pid "$pidf")" || continue
+    pid_alive "$pid" && continue   # still running — not stale
 
     reviewer="$(eff_repo "$repo" | jq -r '.reviewer')"
     reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"
@@ -200,10 +339,19 @@ report_interrupted() {
       rm -f "$pidf"   # A review landed — the run finished (clean-up only).
       continue
     fi
-    n=$((n+1)); list="$list #$repo/$pr"
+    slog="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].session_log // ""' "$STATE_FILE" 2>/dev/null)"
+    outcome="$(session_outcome "$slog")"
+    case "$outcome" in
+      failed) why="agent failed — see ${slog##*/}";;
+      empty)  why="process vanished (reboot / crash / kill)";;
+      *)      why="ended without posting a review — see ${slog##*/}";;
+    esac
+    n=$((n+1)); list="$list
+    #$repo/$pr — $why"
   done < <(jq -r '.handled_prs | keys[]' "$STATE_FILE" 2>/dev/null)
   if [ "$n" -gt 0 ]; then
-    log "REBOOT-RECOVERY: $n previous review session(s) were interrupted by a reboot/crash:$list — those still requested will be re-reviewed automatically."
+    log "SESSION-RECOVERY: $n previous review session(s) ended without posting a review:$list
+    Those still requested will be re-reviewed automatically."
   fi
 }
 
@@ -225,32 +373,30 @@ ensure_mirror() {
 
 # --- discover candidates for one repo -----------------------------------------
 discover() {
-  local repo="$1" reviewer
+  local repo="$1" reviewer p row cid pr since
   local owner="${repo%%/*}" name="${repo##*/}"
+  local -a REQ MENT
   reviewer="$(eff_repo "$repo" | jq -r '.reviewer')"
   ensure_mirror "$owner" "$name" >/dev/null
 
   # 1) requested as reviewer (GitHub search)
-  mapfile -t REQ < <(
-    "$GH" api graphql \
-      -f query="query { search(query: \"repo:$repo is:pr is:open review-requested:$reviewer\", type: ISSUE, first: 100) { edges { node { ... on PullRequest { number } } } } }" \
-      -q '.data.search.edges[].node.number' 2>/dev/null
-  ) || true
+  mapfile -t REQ < <(requested_prs "$repo" "$reviewer") || true
   for p in "${REQ[@]+"${REQ[@]}"}"; do
     [ -n "$p" ] || continue
     CANDIDATES["$(KEY "$repo" "$p")"]="review_requested"
   done
 
   # 2) @mention in an issue/PR comment within the window
-  SINCE="$(date -u -d "-$MENTION_WINDOW_HOURS hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+  since="$(date -u -d "-$MENTION_WINDOW_HOURS hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
     || date -u -v-${MENTION_WINDOW_HOURS}H +%Y-%m-%dT%H:%M:%SZ)"
   mapfile -t MENT < <(
-    "$GH" api "repos/$repo/issues/comments?since=$SINCE&per_page=100" --paginate \
+    "$GH" api "repos/$repo/issues/comments?since=$since&per_page=100" --paginate \
       -q '.[] | select(.user.login != "'"$reviewer"'") | select(.body | test("@'"$reviewer"'"; "i")) | [.id, (.issue_url | split("/") | last)] | @tsv' 2>/dev/null
   ) || true
   for row in "${MENT[@]+"${MENT[@]}"}"; do
     [ -n "$row" ] || continue
     cid="${row%%$'\t'*}"; pr="${row##*$'\t'}"
+    handled_comment "$cid" && continue   # already seen: don't rewrite state every poll
     mark_handled_comment "$cid" "$pr" "$repo"
     if [ "$pr" != "0" ] && [ -n "$pr" ] && ! handled_pr "$repo" "$pr"; then
       CANDIDATES["$(KEY "$repo" "$pr")"]="${CANDIDATES["$(KEY "$repo" "$pr")"]:-mentioned}"
@@ -266,10 +412,13 @@ launch_review() {
   local wtbase="$WORKTREE_BASE/$owner-$name"
   local wt="$wtbase/pr-$pr"
   local SAFE_REPO="$(echo "$repo" | tr '/' '-')"
-  local SESSION_LOG="$LOG_DIR/session-pr-$pr-$(date +%Y%m%d-%H%M%S).log"
+  local SESSION_LOG="$LOG_DIR/session-pr-$SAFE_REPO-$pr-$(date +%Y%m%d-%H%M%S).log"
   local PROMPT_FILE="$LOG_DIR/prompt-$SAFE_REPO-$pr.txt"
   local MODEL_PATCH="$STATE_DIR/model-patch-$SAFE_REPO.yml"
   local pair base_ref head_sha reviewer custom_prompt harness
+  # Inside the per-repo worktree area: it is the agent's cwd, it is already
+  # --add-dir'd, and it keeps the payload out of the bot's own state/ dir.
+  local REVIEW_JSON="$wtbase/review-pr-$pr.json"
   local mprovider mname meffort
   local entry
 
@@ -301,7 +450,14 @@ launch_review() {
       } > "$MODEL_PATCH"
       ;;
     claude)
-      [ -x "$CLAUDE_BIN" ] || { log "FATAL: harness claude: no executable claude at $CLAUDE_BIN (set CLAUDE_BIN)"; return 1; }
+      [ -x "$CLAUDE_BIN" ] || { log "FATAL: harness claude: no executable claude at $CLAUDE_BIN (set claude.bin or \$CLAUDE_BIN)"; return 1; }
+      if [ -n "$CLAUDE_CONFIG_DIR_EFF" ] && [ ! -d "$CLAUDE_CONFIG_DIR_EFF" ]; then
+        log "FATAL: harness claude: config_dir $CLAUDE_CONFIG_DIR_EFF does not exist"; return 1
+      fi
+      if [ -z "${ANTHROPIC_API_KEY:-}" ] \
+         && [ ! -f "${CLAUDE_CONFIG_DIR_EFF:-$HOME/.claude}/.credentials.json" ]; then
+        log "WARNING: no .credentials.json in ${CLAUDE_CONFIG_DIR_EFF:-$HOME/.claude} and ANTHROPIC_API_KEY is unset — the session will probably fail to authenticate (set claude.config_dir to a logged-in profile)"
+      fi
       case "$meffort" in
         ""|low|medium|high|xhigh|max) ;;
         *) log "WARNING: reasoningEffort '$meffort' is not a claude --effort level; ignoring"; meffort="";;
@@ -353,11 +509,13 @@ Do the review from the worktree:
    - git -C "$wt" diff "$base_ref"...HEAD
    - Read the changed files in full ($wt); check build config, error handling, tests, and how it integrates with the rest of the codebase.
 
-3. Audit per the custom instructions above. For EVERY finding, prefer an INLINE comment: pick {path, line (a line number inside the diff hunk, right side), body}. Group findings, then post them in ONE review:
+3. Audit per the custom instructions above. For EVERY finding, prefer an INLINE comment: pick {path, line (a line number inside the diff hunk, right side), body}. Group findings, then post them in ONE review.
 
-   gh api repos/$repo/pulls/$pr/reviews --input - <<'JSON'
-   {"event":"APPROVE","body":"<concise summary of the audit>","comments":[{"path":"<file>","line":<n>,"body":"<finding>"}]}
-   JSON
+   Write the payload to a file (NOT a shell heredoc) and post it with --input:
+
+     payload file: $REVIEW_JSON
+     shape: {"event":"APPROVE","body":"<concise summary of the audit>","comments":[{"path":"<file>","line":<n>,"body":"<finding>"}]}
+     post it:      gh api "repos/$repo/pulls/$pr/reviews" --input "$REVIEW_JSON"
 
    Decide the event by ONE rule:
    - APPROVE whenever there are NO blocking problems. All suggestions and minor notes must be
@@ -368,9 +526,10 @@ Do the review from the worktree:
    into the summary body (or post it as a plain PR comment via gh api repos/$repo/issues/$pr/comments -f body=...).
    Write the review in the same language as the PR.
 
-4. After posting, remove the worktree to keep things tidy:
+4. After posting, remove the worktree and the payload file to keep things tidy:
    git --git-dir="$mirror" worktree remove --force "$wt" 2>/dev/null || true
    git --git-dir="$mirror" worktree prune 2>/dev/null || true
+   rm -f "$REVIEW_JSON"
 
 5. After posting your review, delete the "review in progress" comment from this PR
    (id: $status_cid) so it does not linger: gh api --method DELETE repos/$repo/issues/comments/$status_cid
@@ -386,19 +545,29 @@ EOF
   [ -n "$mname" ] && cargs+=(--model "$mname")
   [ -n "$meffort" ] && cargs+=(--effort "$meffort")
 
-  log "PR #$repo/$pr: launching review session ($reason; harness=$harness, model=${mprovider:+$mprovider/}$mname)"
+  local hinfo="harness=$harness"
+  [ "$harness" = "claude" ] && hinfo="$hinfo, bin=$CLAUDE_BIN, profile=${CLAUDE_CONFIG_DIR_EFF:-<claude default>}"
+  log "PR #$repo/$pr: launching review session ($reason; $hinfo, model=${mprovider:+$mprovider/}$mname)"
   (
-    cd "$BOT_DIR"
+    # setsid: the session leads its own process group, so a later head-moved kill
+    # reaches its git/gh children instead of orphaning them on the worktree.
     case "$harness" in
       claude)
-        nohup "$CLAUDE_BIN" "${cargs[@]}" < "$PROMPT_FILE" > "$SESSION_LOG" 2>&1 &
+        # Keep the agent's cwd out of $BOT_DIR (config.json, logs/prompt-*.txt) and
+        # narrow the git credential to the repo under review, so a prompt injection
+        # in PR content cannot reach the bot's own files or other repos.
+        cd "$wtbase"
+        export GIT_CONFIG_KEY_0="http.${GITHUB_BASE_URL%/}/$repo.git.extraheader"
+        [ -n "$CLAUDE_CONFIG_DIR_EFF" ] && export CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_EFF"
+        nohup setsid "$CLAUDE_BIN" "${cargs[@]}" < "$PROMPT_FILE" > "$SESSION_LOG" 2>&1 &
         ;;
       *)
-        nohup "$NODE" --expose-internals "$DSH_BIN" --profile headless --patch "$MODEL_PATCH" \
+        cd "$BOT_DIR"
+        nohup setsid "$NODE" --expose-internals "$DSH_BIN" --profile headless --patch "$MODEL_PATCH" \
           "$(cat "$PROMPT_FILE")" > "$SESSION_LOG" 2>&1 &
         ;;
     esac
-    echo $! > "$STATE_DIR/session-pr-$SAFE_REPO-$pr.pid"
+    echo $! > "$(pidfile_for "$repo" "$pr")"
   )
   mark_handled_pr "$repo" "$pr" "$reason" "$SESSION_LOG" "$head_sha" "$status_cid"
   log "PR #$repo/$pr: session launched (head $head_sha, status comment $status_cid), log: $SESSION_LOG"
@@ -421,6 +590,7 @@ main() {
 
   report_interrupted
   cleanup_status_comments
+  prune_handled_comments
 
   declare -A CANDIDATES=()
   while IFS= read -r repo; do
@@ -438,26 +608,33 @@ main() {
 
     # --- already handled: only re-review when the PR was re-requested AND changed
     if handled_pr "$repo" "$pr"; then
-      pidfile="$STATE_DIR/session-pr-$(echo "$repo" | tr '/' '-')-$pr.pid"
+      pidfile="$(pidfile_for "$repo" "$pr")"
       cur_sha="$(head_of "$repo" "$pr")"
       last_sha="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].head_sha // ""' "$STATE_FILE")"
 
       if [ "$reason" != "review_requested" ]; then
         log "PR #$repo/$pr: handled ($(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].reason' "$STATE_FILE")) — skip"
-        rm -f "$pidfile"
+        prune_pidfile "$pidfile"
+        continue
+      fi
+
+      # A failed head lookup must not be read as "the head moved": comparing an
+      # empty sha would trigger a pointless full re-review.
+      if [ -z "$cur_sha" ]; then
+        log "PR #$repo/$pr: could not read current head from GitHub — skip this round"
         continue
       fi
 
       # running session: if the PR head moved since the session started, kill it
       # now and fall through to immediately re-review the new commit
-      if [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null) && kill -0 "$pid" 2>/dev/null; then
-        if [ -n "$cur_sha" ] && [ -n "$last_sha" ] && [ "$cur_sha" != "$last_sha" ]; then
+      if pid="$(read_pid "$pidfile")" && pid_alive "$pid"; then
+        if [ -n "$last_sha" ] && [ "$cur_sha" != "$last_sha" ]; then
           if [ "${DRY_RUN:-0}" = "1" ]; then
             log "PR #$repo/$pr: PR head changed while reviewing ($last_sha -> $cur_sha) — DRY_RUN: would kill in-flight session (pid $pid)"
             launched=$((launched+1)); continue
           fi
           log "PR #$repo/$pr: PR head changed while reviewing ($last_sha -> $cur_sha) — killing in-flight session (pid $pid)"
-          kill "$pid" 2>/dev/null || true
+          kill_session "$pid"      # waits for it to actually die before we relaunch
           rm -f "$pidfile"
         else
           log "PR #$repo/$pr: review session already running (pid $pid) — skip"
@@ -468,13 +645,14 @@ main() {
       reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"   # latest live review's commit_id ("" = none)
       if [ -n "$reviewed" ] && [ "$cur_sha" = "$reviewed" ]; then
         log "PR #$repo/$pr: re-requested but no change (head $cur_sha, review still targets it) — skip"
-        rm -f "$pidfile"
+        prune_pidfile "$pidfile"
         continue
       fi
       log "PR #$repo/$pr: re-requested with change (head $cur_sha, last review targeted ${reviewed:-none}, live review: $([ -n "$reviewed" ] && echo yes || echo no)) — re-reviewing"
       if [ "${DRY_RUN:-0}" = "1" ]; then
         launched=$((launched+1)); continue
       fi
+      at_session_cap "$repo" "$pr" && continue
       launch_review "$repo" "$pr" "re-request"
       launched=$((launched+1))
       continue
@@ -493,6 +671,7 @@ main() {
       launched=$((launched+1))
       continue
     fi
+    at_session_cap "$repo" "$pr" && continue
     launch_review "$repo" "$pr" "$reason"
     launched=$((launched+1))
   done

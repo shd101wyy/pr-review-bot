@@ -15,6 +15,13 @@ echo "Config  : $CONFIG_FILE"
 echo "Repos   :"
 jq -r '.repos[] | "    \(.repo)  (reviewer: \(.reviewer) | harness: \(.harness) | model: \(.model.provider | if . != "" then . + "/" else "" end)\(.model.model)\(.model.reasoningEffort // "" | if . != "" then " (" + . + ")" else "" end))"' "$EFFECTIVE_FILE" 2>/dev/null | sed -n '1,20p'
 echo "Harness (global default): $HARNESS ($(harness_label "$HARNESS"))"
+if jq -e '.repos[] | select(.harness == "claude")' "$EFFECTIVE_FILE" >/dev/null 2>&1; then
+  claude_auth="logged in"
+  [ -f "${CLAUDE_CONFIG_DIR_EFF:-$HOME/.claude}/.credentials.json" ] || claude_auth="NO CREDENTIALS FOUND"
+  [ -n "${ANTHROPIC_API_KEY:-}" ] && claude_auth="ANTHROPIC_API_KEY"
+  echo "Claude  : $CLAUDE_BIN"
+  echo "          profile ${CLAUDE_CONFIG_DIR_EFF:-$HOME/.claude (claude default)} — $claude_auth"
+fi
 echo "Model   (global default): ${MODEL_PROVIDER:+$MODEL_PROVIDER / }$MODEL_NAME${MODEL_EFFORT:+ / effort=$MODEL_EFFORT}"
 
 echo
@@ -34,22 +41,21 @@ count=0
 while IFS=$'\t' read -r key reason ts slog; do
   count=$((count+1))
   repo="${key%%#*}"; pr="${key##*#}"
-  pidfile="$STATE_DIR/session-pr-$(echo "$repo" | tr '/' '-')-$pr.pid"
+  pidfile="$(pidfile_for "$repo" "$pr")"
   state="?"
   if [ -n "$slog" ] && [ -f "$slog" ]; then
-    if [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null) && kill -0 "$pid" 2>/dev/null; then
+    if pid="$(read_pid "$pidfile")" && pid_alive "$pid"; then
       state="RUNNING"
       tail1="$(tail -1 "$slog" 2>/dev/null | head -c 90)"
     else
+      case "$(session_outcome "$slog")" in
+        failed) state="FAILED";;
+        empty)  state="ended early (empty log)";;
+        *)      state="finished";;
+      esac
       if jq -e 'type == "object"' "$slog" >/dev/null 2>&1; then
-        # claude -p --output-format json: one object carrying is_error / result
-        [ "$(jq -r '.is_error // false' "$slog" 2>/dev/null)" = "true" ] && state="FAILED" || state="finished"
         tail1="$(jq -r '.result // .stop_reason // ""' "$slog" 2>/dev/null | head -1 | head -c 90)"
-      elif grep -qE 'Error:|at file://|FATAL|MISSING_CREDENTIAL' "$slog" 2>/dev/null; then
-        state="FAILED"
-        tail1="$(tail -2 "$slog" 2>/dev/null | head -1 | head -c 90)"
       else
-        state="finished"
         tail1="$(tail -2 "$slog" 2>/dev/null | head -1 | head -c 90)"
       fi
     fi
@@ -72,14 +78,11 @@ while IFS= read -r repo; do
   while read -r p; do
     [ -n "$p" ] || continue
     PENDING["$repo#$p"]=""
-    rc=$("$GH" api "repos/$repo/pulls/$p/reviews" --paginate \
-      -q '.[] | select(.user.login == "'"$reviewer"'") | select(.state != "DISMISSED") | .commit_id' 2>/dev/null | tail -1)
+    rc="$(reviewed_by "$repo" "$p" "$reviewer")"
     if [ -n "$rc" ] && [ "$(head_of "$repo" "$p")" = "$rc" ]; then
       PENDING["$repo#$p"]="reviewed"
     fi
-  done < <("$GH" api graphql \
-    -f query="query { search(query: \"repo:$repo is:pr is:open review-requested:$reviewer\", type: ISSUE, first: 100) { edges { node { ... on PullRequest { number } } } } }" \
-    -q '.data.search.edges[].node.number' 2>/dev/null)
+  done < <(requested_prs "$repo" "$reviewer")
 done < <(jq -r '.repos[].repo' "$EFFECTIVE_FILE")
 if [ "${#PENDING[@]}" -eq 0 ]; then echo "  (none)"; fi
 for k in $(printf '%s\n' "${!PENDING[@]}" | sort); do
@@ -87,7 +90,8 @@ for k in $(printf '%s\n' "${!PENDING[@]}" | sort); do
   echo "  #$k — ${PENDING[$k]:-NEEDS REVIEW}$h"
 done
 echo
-echo "View a session: tail -f $(echo "$LOG_DIR" | sed 's|'"$BOT_DIR"'/||')/session-pr-<n>-<ts>.log"
+echo "Running: $(count_running_sessions) session(s) (max_concurrent_sessions=$MAX_CONCURRENT_SESSIONS)"
+echo "View a session: tail -f $(echo "$LOG_DIR" | sed 's|'"$BOT_DIR"'/||')/session-pr-<owner>-<repo>-<n>-<ts>.log"
 echo "Note: headless sessions run as separate processes, so they are NOT listed in the DSH web GUI"
 echo "      (it only shows sessions created inside dsh web) nor in \`claude agents\`. A dsh log stays"
 echo "      empty until the session finishes; a claude log is one JSON object written at the end."

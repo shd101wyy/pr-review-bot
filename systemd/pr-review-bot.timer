@@ -2,7 +2,10 @@
 Description=Run the PR review bot poller every minute (script throttles to poll_interval_minutes)
 [Timer]
 OnBootSec=1min
-OnUnitActiveSec=1min
+# OnCalendar, not OnUnitActiveSec: the latter counts from the *end* of the last
+# run, so a ~10s poll pushed wake-ups to ~2min apart and the script's own
+# poll_interval_minutes throttle then fired a minute late.
+OnCalendar=*:0/1
 Persistent=true
 [Install]
 WantedBy=timers.target

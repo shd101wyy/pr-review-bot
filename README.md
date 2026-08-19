@@ -32,12 +32,17 @@ pr-review-bot/
   "reviewer": "your-github-username",   // 全局默认：监听谁被请求 review
   "poll_interval_minutes": 5,           // 轮询频率（timer 每分钟唤醒，脚本按此节流）
   "max_sessions_per_poll": 2,           // 每轮最多新开几个 review session
+  "max_concurrent_sessions": 4,         // 同时最多允许几个 session 在跑（跨轮次的总量上限）
   "mention_window_hours": 24,           // 只关注最近 N 小时内的 @mention 评论
   "harness": "claude",                  // 全局默认 harness："claude" 或 "dsh"
   "model": {                            // 全局默认模型
     "provider": "",                     // claude 忽略此字段，留空即可；dsh 必填
     "model": "opus",                    // claude：别名或完整 id；dsh：provider 下的模型名
     "reasoningEffort": "high"
+  },
+  "claude": {                           // 仅 harness=claude 时有效，且**只能写在顶层**
+    "bin": "",                          // "" = 自动探测 PATH 上的 claude；也可写绝对路径
+    "config_dir": "~/.claude-sk"        // "" = claude 默认的 ~/.claude；见下文「claude 的 profile」
   },
   "gh": {
     "token_env": "",                    // 可选：读哪个环境变量作为 GitHub token
@@ -89,10 +94,53 @@ pr-review-bot/
 4. `model.provider` 对 claude 无意义，**请留空**：它会出现在 PR 上那条"正在 review"评论里
    （留空时只显示模型名，不显示 `provider/`）。从 claude 切回 dsh 时记得把 provider 填回去。
 
+### claude 的 profile（`claude.config_dir`）——容易踩的坑
+
+如果你平时用的是 `claude-sk` 这类命令，先确认它到底是什么：
+
+```bash
+type claude-sk
+# claude-sk is an alias for CLAUDE_CONFIG_DIR="$HOME/.claude-sk" claude
+```
+
+多数情况下它是一个 **shell alias**：同一个 `claude` 可执行文件，只是换了 `CLAUDE_CONFIG_DIR`
+（即换了一套登录态 / 账号 / 历史）。这带来两个后果：
+
+1. **alias 在脚本里不存在**。systemd 与 `poll.sh` 都不是交互式 shell，不会读 `.zshrc`，
+   所以 bot 无法"运行 claude-sk"——只能运行真正的可执行文件 `claude`，再自己把 profile
+   通过 `CLAUDE_CONFIG_DIR` 传进去。这正是 `claude.config_dir` 的作用。
+2. **默认 profile 往往没登录**。`~/.claude` 里可能根本没有 `.credentials.json`，
+   而 `~/.claude-sk` 里才有。此时不配 `config_dir`，session 会直接因为找不到配置而失败。
+
+所以：把 `claude.config_dir` 指向**真正登录了的那个目录**（对应 alias 里的值）。校验方式：
+
+```bash
+./status.sh | grep -A1 '^Claude'
+#   Claude  : /home/deck/.local/bin/claude
+#             profile /home/deck/.claude-sk — logged in
+```
+
+优先级：环境变量 `CLAUDE_BIN` / `CLAUDE_CONFIG_DIR` > `config.json` 的 `claude.*` > 自动探测。
+`bin` 写成不带斜线的名字时会先用 `command -v` 解析成绝对路径；写成 alias 名字（如 `claude-sk`）
+是**无效**的——脚本无法执行 alias，请改用 `bin` + `config_dir` 的组合。
+启动前会做预检：`config_dir` 不存在直接 FATAL（不会在 PR 上留下任何评论）；目录存在但没有
+`.credentials.json` 且没有 `ANTHROPIC_API_KEY` 时打 WARNING。
+
+> `claude` 这个配置块是**机器级**的，只能写在顶层；写进 `repos[]` 会被忽略（poll.log 会告警）。
+> 另外注意 bot 与你的交互式会话共用同一个 profile 目录，session 历史会写进同一个 `projects/` 下。
+
 > **安全提示**：无论哪个 harness，agent 都在拥有 GitHub 写权限 token 的情况下读取
-> 攻击者可控的 PR 内容（diff、源码、PR 描述），存在 prompt injection 风险。建议把
-> token 换成仅对目标仓库开放 `pull_requests: read/write` 的 fine-grained token，
-> 并考虑把 session 放进容器里跑。
+> 攻击者可控的 PR 内容（diff、源码、PR 描述），存在 prompt injection 风险。已做的收敛：
+>
+> - `claude` session 的 cwd 是 `worktrees/<owner>-<repo>/`，**不是** bot 目录，
+>   `config.json` 与 `logs/prompt-*.txt` 不在它的工作目录里；
+> - session 继承的 git 凭据被收窄到**当前这个仓库**
+>   （`http.<base>/<owner>/<repo>.git.extraheader`），用它访问同一 host 上的其它私有仓库会被拒；
+> - review 的 JSON payload 写在 worktree 目录内，不落在 bot 的 `state/` 里。
+>
+> 仍建议把 token 换成仅对目标仓库开放 `pull_requests: read/write` 的 fine-grained token，
+> 并考虑把 session 放进容器里跑（`bypassPermissions` 意味着 agent 在容器外拥有完整工具权限）。
+> 另外 `logs/` 下的 prompt 与 session 日志包含 PR 的完整内容，按仓库敏感度决定是否定期清理。
 
 切换后无需改任何脚本，只改 `config.json` 里的 `harness` 字段再跑一次 `./status.sh`
 确认生效（会打印每个仓库的 harness）。
@@ -137,12 +185,17 @@ DRY_RUN=1 ./run-now.sh
 ## 工作原理
 
 1. **发现**：每个仓库用 GitHub Search GraphQL 查 `review-requested:<该仓库的 reviewer>` 的
-   open PR；另外扫描最近 N 小时内的 issue/PR 评论中 `@<reviewer>` 的提及。
+   open PR（**分页**拉取，不再被 `first: 100` 截断）；另外扫描最近 N 小时内的 issue/PR
+   评论中 `@<reviewer>` 的提及（已处理过的评论 id 会跳过，过期条目自动清理）。
 2. **去重与 re-request**：`state.json` 记录已处理/已 review 的 PR（含当时的 head_sha）与评论 id，
    避免重复触发。如果某个 PR 之后又被 re-request review，仅当**内容有变化**时才重新审查：
    PR head 出现了新 commit，或之前的 review 已被 dismiss；否则跳过。
    **review 进行中若 PR 出现新 commit，poller 会立即终止进行中的 session，并在同一轮
    为新 commit 重新开启 review**（发现延迟 ≤ poll_interval_minutes，可调小以获得更快的响应）。
+   终止时按**进程组**发信号（session 用 `setsid` 启动，自成进程组），先 SIGTERM、约 5s 后
+   SIGKILL，确保它派生的 git/gh 子进程不残留、不继续写同一个 worktree；确认进程真正退出后
+   才重开新 session。若某轮拿不到 PR 当前 head（GitHub 临时报错），该 PR 本轮跳过，不会被
+   误判为"有新 commit"而白跑一次 review。
 3. **审查**：每个新 PR 启动一个 headless session（harness 见上文），prompt 指引 agent：
    在对应仓库的 git worktree 里拉取该 PR 的 head，`git diff` 对比 base 分支，逐文件阅读，
    按 custom prompt 审计，最后用 `gh api .../pulls/N/reviews` 一次性提交 review
@@ -150,6 +203,8 @@ DRY_RUN=1 ./run-now.sh
    作为 inline comments 挂在 approve 上，不阻塞）；有阻塞问题才 REQUEST_CHANGES；
    拿不准/草稿阶段用 COMMENT。
 4. **清理**：session 结束后自动移除 worktree，多个 PR 并行互不冲突。
+   并发上限由 `max_concurrent_sessions` 控制：`max_sessions_per_poll` 只限制**每轮新开**几个，
+   没有总量上限的话多轮会把 agent 堆叠在同一台机器上。`./status.sh` 会显示当前在跑的数量。
 
 **进行中提示**：review 触发时会在 PR 上发一条"正在 review"评论，说明 reviewer、所用
 provider/model 与 reasoning effort、以及正在审查的目标 HEAD commit；review 落地后该评论被
@@ -159,6 +214,11 @@ provider/model 与 reasoning effort、以及正在审查的目标 HEAD commit；
 
 轮询由 systemd 用户级 timer 驱动：timer 每分钟唤醒 `pr-review-bot.service`（oneshot），
 脚本按 `config.json` 的 `poll_interval_minutes` 节流，所以改频率只改配置文件即可。
+
+> timer 用 `OnCalendar=*:0/1`（每个整分钟）而不是 `OnUnitActiveSec=1min`：后者从上一次运行
+> **结束**开始计时，poll 本身耗时约 10s 就会把唤醒拖到约 2 分钟一次，脚本的 5 分钟节流实际
+> 变成 6 分钟。改了 `systemd/` 下的 unit 之后需要重新安装才生效：
+> `cp systemd/pr-review-bot.{service,timer} ~/.config/systemd/user/ && systemctl --user daemon-reload`
 
 **unit 文件定义在哪里？** 不在本仓库里，而是安装在 systemd 的用户目录：
 
@@ -203,8 +263,10 @@ systemctl --user start pr-review-bot.service   # 或 ./run-now.sh
 ## 故障排查
 
 - 机器重启/崩溃：进行中的 review session 会随进程终止，但下一次 poll 会自动为**仍被请求**的
-  PR 重新开启 review（不做断点续传，从头重审）；`poll.log` 会打印 `REBOOT-RECOVERY` 横幅列出
-  被中断的 session。已正常完成的 review 会顺带清理，不会误报。
+  PR 重新开启 review（不做断点续传，从头重审）；`poll.log` 会打印 `SESSION-RECOVERY` 横幅，
+  并逐条说明原因：`process vanished`（重启/崩溃/被 kill，日志为空）、`agent failed`（agent
+  自己报错，附日志文件名）、`ended without posting a review`。已正常完成的 review 会顺带
+  清理，不会误报。
 - 私有仓库 clone/fetch 失败 → 确认 `gh auth status` 有 token；或在配置 `gh.token_env`
   指向一个含 GitHub token 的环境变量（例如在 systemd unit 或 shell 中 export）。
 - 模型不对 → `dsh` 检查 `state/model-patch-<repo>.yml`（由合并后的 effective 配置生成）；
