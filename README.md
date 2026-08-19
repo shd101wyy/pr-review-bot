@@ -44,6 +44,11 @@ pr-review-bot/
     "bin": "",                          // "" = 自动探测 PATH 上的 claude；也可写绝对路径
     "config_dir": "~/.claude-sk"        // "" = claude 默认的 ~/.claude；见下文「claude 的 profile」
   },
+  "session_env": {                      // 注入到 review session 进程的环境变量（值必须单行）
+    "HTTPS_PROXY": "http://127.0.0.1:8889",   // 本机网络下模型 API 只能走本地代理，见下文
+    "NO_PROXY": "localhost,127.0.0.1,::1",
+    "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt"
+  },
   "gh": {
     "token_env": "",                    // 可选：读哪个环境变量作为 GitHub token
     "token": "",                        // 可选：直接写 token（优先级：token_env > token > gh keyring）
@@ -210,6 +215,26 @@ DRY_RUN=1 ./run-now.sh
 provider/model 与 reasoning effort、以及正在审查的目标 HEAD commit；review 落地后该评论被
 删除（agent 完成后自行删除 + poller 兜底清理），让团队随时知道目前谁在审、审的是哪个 commit。
 
+### session_env：为什么必须配代理（否则 403）
+
+`poll.sh` 手动跑时会继承你 shell 的环境变量，但 **systemd 启动时不会**——user service 的环境
+非常干净。本机的模型 API 只能经由本地代理访问，直连会被拒：
+
+```
+{"is_error":true,"api_error_status":403,"result":"Failed to authenticate. API Error: 403 Request not allowed"}
+```
+
+现象是 session 启动一两秒后就退出、日志里只有上面这一行 JSON。所以把代理与 CA 证书路径写进
+`session_env`，poll.sh 会在启动 agent 前把它们 export 到 session 进程里（两种 harness 都生效）：
+
+```bash
+./status.sh | grep '^Session env'      # 确认已加载
+tr '\0' '\n' < /proc/<session-pid>/environ | grep -i proxy   # 确认真的进了进程
+```
+
+放在 `config.json`（已被 gitignore）而不是 systemd unit 里，是为了让仓库里的 unit 文件保持
+与机器无关；同时手动跑和 timer 跑走的是同一份配置，不会出现"手动能跑、定时不能跑"的偏差。
+
 ## 调度（systemd 用户级 timer）
 
 轮询由 systemd 用户级 timer 驱动：timer 每分钟唤醒 `pr-review-bot.service`（oneshot），
@@ -262,6 +287,10 @@ systemctl --user start pr-review-bot.service   # 或 ./run-now.sh
 
 ## 故障排查
 
+- **定时任务没结果，但手动跑正常** → 两个已修的坑，若你从旧版本升级请一并检查：
+  (1) service 必须带 `KillMode=process`，否则 `Type=oneshot` 的 unit 在 `poll.sh` 退出时会
+  连带杀掉刚启动的 review session（`nohup`/`setsid` 都逃不出 cgroup），表现为 session 日志
+  0 字节；(2) 见上文 `session_env`（403）。
 - 机器重启/崩溃：进行中的 review session 会随进程终止，但下一次 poll 会自动为**仍被请求**的
   PR 重新开启 review（不做断点续传，从头重审）；`poll.log` 会打印 `SESSION-RECOVERY` 横幅，
   并逐条说明原因：`process vanished`（重启/崩溃/被 kill，日志为空）、`agent failed`（agent

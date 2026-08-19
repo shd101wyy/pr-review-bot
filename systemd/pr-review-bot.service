@@ -5,6 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# The review session is launched detached and outlives poll.sh by many minutes.
+# With the default KillMode=control-group, systemd tears down this oneshot unit's
+# cgroup the moment ExecStart exits and kills that session (nohup/setsid do not
+# escape a cgroup) — every timer-driven review died instantly with an empty log.
+# KillMode=process limits the teardown to poll.sh itself.
+KillMode=process
 # %h = the user's home directory. systemd units do NOT expand `~`.
 ExecStart=%h/Workspace/pr-review-bot/poll.sh
 StandardOutput=append:%h/Workspace/pr-review-bot/logs/poll.log

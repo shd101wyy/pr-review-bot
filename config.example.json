@@ -14,6 +14,11 @@
     "bin": "",
     "config_dir": ""
   },
+  "session_env": {
+    "HTTPS_PROXY": "",
+    "NO_PROXY": "",
+    "SSL_CERT_FILE": ""
+  },
   "gh": {
     "token_env": "",
     "token": "",

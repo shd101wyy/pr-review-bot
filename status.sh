@@ -15,6 +15,11 @@ echo "Config  : $CONFIG_FILE"
 echo "Repos   :"
 jq -r '.repos[] | "    \(.repo)  (reviewer: \(.reviewer) | harness: \(.harness) | model: \(.model.provider | if . != "" then . + "/" else "" end)\(.model.model)\(.model.reasoningEffort // "" | if . != "" then " (" + . + ")" else "" end))"' "$EFFECTIVE_FILE" 2>/dev/null | sed -n '1,20p'
 echo "Harness (global default): $HARNESS ($(harness_label "$HARNESS"))"
+if [ "${SESSION_ENV_COUNT:-0}" -gt 0 ]; then
+  echo "Session env: $SESSION_ENV_COUNT var(s) injected into each session: $(jq -r '(.session_env // {}) | keys | join(", ")' "$CONFIG_FILE")"
+else
+  echo "Session env: (none) — note systemd passes NO shell env; set session_env if the API needs a proxy"
+fi
 if jq -e '.repos[] | select(.harness == "claude")' "$EFFECTIVE_FILE" >/dev/null 2>&1; then
   claude_auth="logged in"
   [ -f "${CLAUDE_CONFIG_DIR_EFF:-$HOME/.claude}/.credentials.json" ] || claude_auth="NO CREDENTIALS FOUND"

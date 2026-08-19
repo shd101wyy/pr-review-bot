@@ -52,6 +52,7 @@ load_config() {
   MODEL_NAME="$(jq -r '.model.model // ""' "$CONFIG_FILE")"
   MODEL_EFFORT="$(jq -r '.model.reasoningEffort // ""' "$CONFIG_FILE")"
   CUSTOM_PROMPT="$(jq -r '.custom_prompt // ""' "$CONFIG_FILE")"
+  SESSION_ENV_COUNT="$(jq -r '(.session_env // {}) | length' "$CONFIG_FILE")"
   CLAUDE_CFG_BIN="$(jq -r '.claude.bin // ""' "$CONFIG_FILE")"
   CLAUDE_CFG_DIR="$(jq -r '.claude.config_dir // ""' "$CONFIG_FILE")"
   TOKEN_ENV="$(jq -r '.gh.token_env // ""' "$CONFIG_FILE")"
@@ -545,10 +546,24 @@ EOF
   [ -n "$mname" ] && cargs+=(--model "$mname")
   [ -n "$meffort" ] && cargs+=(--effort "$meffort")
 
-  local hinfo="harness=$harness"
+  local hinfo="harness=$harness, session_env=${SESSION_ENV_COUNT}var"
   [ "$harness" = "claude" ] && hinfo="$hinfo, bin=$CLAUDE_BIN, profile=${CLAUDE_CONFIG_DIR_EFF:-<claude default>}"
+  # 9>&- / 7>&-: the session must NOT inherit the poll lock (fd 9) or the state
+  # lock (fd 7). An inherited fd 9 kept the flock held for the session's whole
+  # lifetime, so every later poll logged "another poll is running, skip" and no
+  # other repo or PR could be discovered until the review finished.
   log "PR #$repo/$pr: launching review session ($reason; $hinfo, model=${mprovider:+$mprovider/}$mname)"
   (
+    # Machine-specific environment for the agent, from config.json's session_env
+    # (values must be single-line). The poller inherits a shell env when run by
+    # hand but NOT when run by systemd, and on this network the model API is only
+    # reachable through a local proxy — without it the session dies at once with
+    # "403 Request not allowed". Keeping this in config.json (which is gitignored)
+    # leaves the vendored systemd unit machine-independent.
+    while IFS= read -r kv; do
+      [ -n "$kv" ] && export "$kv"
+    done < <(jq -r '(.session_env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE")
+
     # setsid: the session leads its own process group, so a later head-moved kill
     # reaches its git/gh children instead of orphaning them on the worktree.
     case "$harness" in
@@ -559,12 +574,12 @@ EOF
         cd "$wtbase"
         export GIT_CONFIG_KEY_0="http.${GITHUB_BASE_URL%/}/$repo.git.extraheader"
         [ -n "$CLAUDE_CONFIG_DIR_EFF" ] && export CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_EFF"
-        nohup setsid "$CLAUDE_BIN" "${cargs[@]}" < "$PROMPT_FILE" > "$SESSION_LOG" 2>&1 &
+        nohup setsid "$CLAUDE_BIN" "${cargs[@]}" < "$PROMPT_FILE" > "$SESSION_LOG" 2>&1 9>&- 7>&- &
         ;;
       *)
         cd "$BOT_DIR"
         nohup setsid "$NODE" --expose-internals "$DSH_BIN" --profile headless --patch "$MODEL_PATCH" \
-          "$(cat "$PROMPT_FILE")" > "$SESSION_LOG" 2>&1 &
+          "$(cat "$PROMPT_FILE")" > "$SESSION_LOG" 2>&1 9>&- 7>&- &
         ;;
     esac
     echo $! > "$(pidfile_for "$repo" "$pr")"
