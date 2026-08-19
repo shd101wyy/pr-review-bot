@@ -156,6 +156,9 @@ systemctl --user start pr-review-bot.service   # 或 ./run-now.sh
 
 ## 故障排查
 
+- 机器重启/崩溃：进行中的 review session 会随进程终止，但下一次 poll 会自动为**仍被请求**的
+  PR 重新开启 review（不做断点续传，从头重审）；`poll.log` 会打印 `REBOOT-RECOVERY` 横幅列出
+  被中断的 session。已正常完成的 review 会顺带清理，不会误报。
 - 私有仓库 clone/fetch 失败 → 确认 `gh auth status` 有 token；或在配置 `gh.token_env`
   指向一个含 GitHub token 的环境变量（例如在 systemd unit 或 shell 中 export）。
 - 模型不对 → 检查 `state/model-patch-<repo>.yml`，它由合并后的 effective 配置生成。

@@ -127,6 +127,34 @@ reviewed_by() {  # prints non-empty if $3 has a live (non-dismissed) review on r
   printf '%s' "$rv"
 }
 
+# --- report review sessions interrupted by a reboot/crash -----------------------
+# A session that genuinely finished has a live review by the time the next poll
+# runs, so its stale pid file is just clean-up. A session killed mid-run has no
+# such review yet and is reported as needing a re-review. (Whether a later commit
+# should be re-reviewed at all is the main loop's call, not this report's.)
+report_interrupted() {
+  local n=0 list="" repo pr pidf pid reviewed reviewer
+  while IFS=# read -r repo pr; do
+    [ -n "$repo" ] && [ -n "$pr" ] || continue
+    pidf="$STATE_DIR/session-pr-$(echo "$repo" | tr '/' '-')-$pr.pid"
+    [ -f "$pidf" ] || continue
+    pid="$(cat "$pidf" 2>/dev/null || echo 0)"
+    if [ "$pid" -le 1 ]; then rm -f "$pidf"; continue; fi
+    kill -0 "$pid" 2>/dev/null && continue   # still running — not stale
+
+    reviewer="$(eff_repo "$repo" | jq -r '.reviewer')"
+    reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"
+    if [ -n "$reviewed" ]; then
+      rm -f "$pidf"   # A review landed — the run finished (clean-up only).
+      continue
+    fi
+    n=$((n+1)); list="$list #$repo/$pr"
+  done < <(jq -r '.handled_prs | keys[]' "$STATE_FILE" 2>/dev/null)
+  if [ "$n" -gt 0 ]; then
+    log "REBOOT-RECOVERY: $n previous review session(s) were interrupted by a reboot/crash:$list — those still requested will be re-reviewed automatically."
+  fi
+}
+
 # --- ensure a git mirror exists for a repo (parallel-safe via flock) ----------
 ensure_mirror() {
   local owner="$1" name="$2"
@@ -298,6 +326,8 @@ main() {
     date +%s > "$LAST_POLL_FILE"
   fi
 
+  report_interrupted
+
   declare -A CANDIDATES=()
   while IFS= read -r repo; do
     [ -n "$repo" ] || continue
@@ -314,22 +344,25 @@ main() {
 
     # --- already handled: only re-review when the PR was re-requested AND changed
     if handled_pr "$repo" "$pr"; then
-      if [ "$reason" != "review_requested" ]; then
-        log "PR #$repo/$pr: handled ($(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].reason' "$STATE_FILE")) — skip"
-        continue
-      fi
-      # running session: if the PR head moved since the session started, kill it
-      # now and fall through to immediately re-review the new commit
       pidfile="$STATE_DIR/session-pr-$(echo "$repo" | tr '/' '-')-$pr.pid"
       cur_sha="$(head_of "$repo" "$pr")"
+      last_sha="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].head_sha // ""' "$STATE_FILE")"
+
+      if [ "$reason" != "review_requested" ]; then
+        log "PR #$repo/$pr: handled ($(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].reason' "$STATE_FILE")) — skip"
+        rm -f "$pidfile"
+        continue
+      fi
+
+      # running session: if the PR head moved since the session started, kill it
+      # now and fall through to immediately re-review the new commit
       if [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null) && kill -0 "$pid" 2>/dev/null; then
-        run_sha="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].head_sha // ""' "$STATE_FILE")"
-        if [ -n "$cur_sha" ] && [ -n "$run_sha" ] && [ "$cur_sha" != "$run_sha" ]; then
+        if [ -n "$cur_sha" ] && [ -n "$last_sha" ] && [ "$cur_sha" != "$last_sha" ]; then
           if [ "${DRY_RUN:-0}" = "1" ]; then
-            log "PR #$repo/$pr: PR head changed while reviewing ($run_sha -> $cur_sha) — DRY_RUN: would kill in-flight session (pid $pid)"
+            log "PR #$repo/$pr: PR head changed while reviewing ($last_sha -> $cur_sha) — DRY_RUN: would kill in-flight session (pid $pid)"
             launched=$((launched+1)); continue
           fi
-          log "PR #$repo/$pr: PR head changed while reviewing ($run_sha -> $cur_sha) — killing in-flight session (pid $pid)"
+          log "PR #$repo/$pr: PR head changed while reviewing ($last_sha -> $cur_sha) — killing in-flight session (pid $pid)"
           kill "$pid" 2>/dev/null || true
           rm -f "$pidfile"
         else
@@ -337,10 +370,11 @@ main() {
           continue
         fi
       fi
-      last_sha="$(jq -r --arg k "$(KEY "$repo" "$pr")" '.handled_prs[$k].head_sha // ""' "$STATE_FILE")"
+
       reviewed="$(reviewed_by "$repo" "$pr" "$reviewer")"
       if [ -n "$reviewed" ] && { [ -z "$last_sha" ] || [ "$cur_sha" = "$last_sha" ]; }; then
         log "PR #$repo/$pr: re-requested but no change (head $cur_sha, review still up) — skip"
+        rm -f "$pidfile"
         continue
       fi
       log "PR #$repo/$pr: re-requested with change (head ${last_sha:-?} -> ${cur_sha:-?}, live review: $([ -n "$reviewed" ] && echo yes || echo no)) — re-reviewing"
