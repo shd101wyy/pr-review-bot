@@ -12,7 +12,8 @@
 pr-review-bot/
 ├── config.json        # 所有可配置项（不在 git 版本控制内）
 ├── config.example.json # 可移植配置模板
-├── poll.sh            # 核心逻辑：发现候选 PR -> 启动 headless review session（timer 每 1 分钟调用）
+├── poll.sh            # 核心逻辑：发现候选 PR -> 启动 review session（timer 每 1 分钟调用）
+├── review-session.sh  # 单次 session 的执行者：跑 agent -> 按 blocking 判定 event -> 提交 review -> 清理
 ├── run-now.sh         # 手动控制：立即轮询 / 手动 review 某个 PR / 查看状态
 ├── status.sh          # 查看当前状态（正在 review 哪些 PR、历史、等待队列）
 ├── systemd/           # systemd 用户级 unit 文件副本（service + timer，安装见下文「调度」）
@@ -201,12 +202,11 @@ DRY_RUN=1 ./run-now.sh
    SIGKILL，确保它派生的 git/gh 子进程不残留、不继续写同一个 worktree；确认进程真正退出后
    才重开新 session。若某轮拿不到 PR 当前 head（GitHub 临时报错），该 PR 本轮跳过，不会被
    误判为"有新 commit"而白跑一次 review。
-3. **审查**：每个新 PR 启动一个 headless session（harness 见上文），prompt 指引 agent：
+3. **审查**：每个新 PR 启动一个 session（`review-session.sh`，harness 见上文），prompt 指引 agent：
    在对应仓库的 git worktree 里拉取该 PR 的 head，`git diff` 对比 base 分支，逐文件阅读，
-   按 custom prompt 审计，最后用 `gh api .../pulls/N/reviews` 一次性提交 review
-   （inline comments 优先）。结果判定：**没有 blocking 问题就 APPROVE**（所有建议/小问题一律
-   作为 inline comments 挂在 approve 上，不阻塞）；有阻塞问题才 REQUEST_CHANGES；
-   拿不准/草稿阶段用 COMMENT。
+   按 custom prompt 审计。**agent 不提交 review**，只把结论写进一个 findings JSON 文件；
+   由 `review-session.sh` 读取该文件、判定 event、调用 `gh api .../pulls/N/reviews` 一次性提交
+   （inline comments 优先），并负责删除"正在 review"评论与移除 worktree。
 4. **清理**：session 结束后自动移除 worktree，多个 PR 并行互不冲突。
    并发上限由 `max_concurrent_sessions` 控制：`max_sessions_per_poll` 只限制**每轮新开**几个，
    没有总量上限的话多轮会把 agent 堆叠在同一台机器上。`./status.sh` 会显示当前在跑的数量。
@@ -234,6 +234,46 @@ tr '\0' '\n' < /proc/<session-pid>/environ | grep -i proxy   # 确认真的进�
 
 放在 `config.json`（已被 gitignore）而不是 systemd unit 里，是为了让仓库里的 unit 文件保持
 与机器无关；同时手动跑和 timer 跑走的是同一份配置，不会出现"手动能跑、定时不能跑"的偏差。
+
+## review 结论由代码判定（不交给模型）
+
+早期版本把 event 的选择写在 prompt 里，让 agent 自己调用 reviews API。实测不可靠：一次 DSH
+运行在正文里写了"**No blockers.**"，提交的却是 `COMMENTED` 而不是 `APPROVE`。现在这件事由
+`review-session.sh` 用代码决定。
+
+**agent 的唯一交付物**是一个 findings 文件（路径由 prompt 给出，位于 worktree 上一层）：
+
+```json
+{
+  "summary": "<review 正文，markdown>",
+  "unsure": false,
+  "findings": [
+    {"path": "src/a.rs", "line": 12, "body": "nit: 命名", "blocking": false},
+    {"body": "无法定位到某一行的意见，会并入正文", "blocking": false}
+  ]
+}
+```
+
+判定规则（纯代码，两种 harness 完全一致）：
+
+| 条件 | event |
+|---|---|
+| 任意 finding 的 `blocking` 为真 | `REQUEST_CHANGES` |
+| 无 blocking，但 `unsure` 为真 | `COMMENT` |
+| 其余（含零 findings） | **`APPROVE`** |
+
+配套细节：
+
+- **失败方向安全**：`blocking` 写成 `"true"` / `1` / `"yes"` 一律按阻塞处理；计数读不出来时
+  也按阻塞处理——绝不会因为解析问题而误批准。
+- 带 `path` + `line` 的 finding 走 inline comment；缺其一的自动并入正文的「Additional notes」。
+- review 固定 `commit_id` 为本次审查的 head，因此 re-review 判定（比对 review 的 commit_id）依然准确。
+- 若 GitHub 因为行号不在 diff hunk 内拒绝整个 review（422），会自动降级重发一次：去掉 inline
+  comments、把全部 findings 写进正文，代价只是排版而不是丢掉整个 review。
+- findings 文件缺失或不是合法 JSON → **不提交任何 review**，日志写 `SESSION-RESULT: failed`，
+  "正在 review"评论保留，下一轮 poll 会报告并重试。
+- 每个 session 结束时都会写一行 `SESSION-RESULT: ok|failed`，`status.sh` 直接据此判断状态，
+  不再靠猜日志内容。
 
 ## 调度（systemd 用户级 timer）
 
@@ -303,4 +343,7 @@ systemctl --user start pr-review-bot.service   # 或 ./run-now.sh
 - 机器上找不到 gh/node/DSH/claude → 显式设置 `GH`、`NODE`、`DSH_BIN`、`CLAUDE_BIN` 环境变量后重跑。
 - `harness` 写错（既不是 `dsh` 也不是 `claude`）→ 该 PR 会在**发出任何 PR 评论之前**被跳过，
   `poll.log` 打印 `FATAL: unknown harness`。
-- session 失败 → 查看对应 `logs/session-pr-*.log` 尾部报错。
+- session 失败 → 先看 `logs/session-pr-*.log` 最后一行的 `SESSION-RESULT:`；
+  `failed reason=no-findings-file` 表示 agent 没写出 findings（agent 自身的原始输出在
+  `logs/agent-<repo>-<pr>-<ts>.json`，可复现的 agent 命令在 `state/agent-cmd-<repo>-<pr>.sh`，
+  直接 `bash` 它即可手动重跑）。

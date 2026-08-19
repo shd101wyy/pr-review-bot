@@ -255,6 +255,9 @@ at_session_cap() {  # repo pr -> true (0) when we must not launch now
 session_outcome() {  # logfile
   local slog="$1"
   [ -n "$slog" ] && [ -s "$slog" ] || { echo empty; return 0; }
+  # review-session.sh ends with an explicit verdict line; trust it over guessing.
+  if grep -q 'SESSION-RESULT: ok' "$slog" 2>/dev/null; then echo finished; return 0; fi
+  if grep -q 'SESSION-RESULT: failed' "$slog" 2>/dev/null; then echo failed; return 0; fi
   if jq -e 'type == "object"' "$slog" >/dev/null 2>&1; then
     [ "$(jq -r '.is_error // false' "$slog" 2>/dev/null)" = "true" ] && echo failed || echo finished
   elif grep -qE 'Error:|at file://|FATAL|MISSING_CREDENTIAL' "$slog" 2>/dev/null; then
@@ -419,7 +422,9 @@ launch_review() {
   local pair base_ref head_sha reviewer custom_prompt harness
   # Inside the per-repo worktree area: it is the agent's cwd, it is already
   # --add-dir'd, and it keeps the payload out of the bot's own state/ dir.
-  local REVIEW_JSON="$wtbase/review-pr-$pr.json"
+  local FINDINGS_JSON="$wtbase/findings-pr-$pr.json"
+  local AGENT_CMD_FILE="$STATE_DIR/agent-cmd-$SAFE_REPO-$pr.sh"
+  local AGENT_LOG="$LOG_DIR/agent-$SAFE_REPO-$pr-$(date +%Y%m%d-%H%M%S).json"
   local mprovider mname meffort
   local entry
 
@@ -510,33 +515,35 @@ Do the review from the worktree:
    - git -C "$wt" diff "$base_ref"...HEAD
    - Read the changed files in full ($wt); check build config, error handling, tests, and how it integrates with the rest of the codebase.
 
-3. Audit per the custom instructions above. For EVERY finding, prefer an INLINE comment: pick {path, line (a line number inside the diff hunk, right side), body}. Group findings, then post them in ONE review.
+3. Audit per the custom instructions above, then write EVERY finding to this file — this file is
+   your only deliverable:
 
-   Write the payload to a file (NOT a shell heredoc) and post it with --input:
+     $FINDINGS_JSON
 
-     payload file: $REVIEW_JSON
-     shape: {"event":"APPROVE","body":"<concise summary of the audit>","comments":[{"path":"<file>","line":<n>,"body":"<finding>"}]}
-     post it:      gh api "repos/$repo/pulls/$pr/reviews" --input "$REVIEW_JSON"
+   Schema (write valid JSON, nothing else, using a file-writing tool — not a shell heredoc):
 
-   Decide the event by ONE rule:
-   - APPROVE whenever there are NO blocking problems. All suggestions and minor notes must be
-     attached as inline comments to the approve — they never block it.
-   - REQUEST_CHANGES only when at least one blocking issue must be fixed before merge.
-   - COMMENT only when you are unsure or the PR is an early draft.
-   If a comment's line is rejected as outside the hunk, drop the line and fold the finding
-   into the summary body (or post it as a plain PR comment via gh api repos/$repo/issues/$pr/comments -f body=...).
-   Write the review in the same language as the PR.
+     {
+       "summary": "<concise markdown summary of the audit; this becomes the review body>",
+       "unsure": false,
+       "findings": [
+         {"path": "<repo-relative file>", "line": <line number inside the diff hunk, right side>,
+          "body": "<the finding>", "blocking": false}
+       ]
+     }
 
-4. After posting, remove the worktree and the payload file to keep things tidy:
-   git --git-dir="$mirror" worktree remove --force "$wt" 2>/dev/null || true
-   git --git-dir="$mirror" worktree prune 2>/dev/null || true
-   rm -f "$REVIEW_JSON"
+   Rules for the fields:
+   - "blocking": true ONLY if the issue must be fixed before this PR can merge. Suggestions,
+     nits, style points, and "consider…" notes are ALWAYS "blocking": false.
+   - "unsure": true only when you could not really assess the change (e.g. an early draft).
+   - "path"/"line" are optional per finding: omit them for anything you cannot pin to a diff
+     line, and it will be folded into the review body instead of an inline comment.
+   - Write the findings in the same language as the PR.
 
-5. After posting your review, delete the "review in progress" comment from this PR
-   (id: $status_cid) so it does not linger: gh api --method DELETE repos/$repo/issues/comments/$status_cid
-   (If it is already gone or the delete fails, that is fine — the poller retries the cleanup.)
+   DO NOT post the review yourself, do not call the reviews API, do not delete any comment and
+   do not remove the worktree. The bot reads this file, decides the review event from the
+   "blocking" flags (no blocking findings => it approves), posts the single review, and cleans up.
 
-6. Finish by reporting: what you reviewed, key findings, and the posted review id.
+4. Finish by reporting what you reviewed and the key findings.
 EOF
 
   # claude reads the prompt on stdin (no argv size limit) and needs the mirror /
@@ -566,6 +573,8 @@ EOF
 
     # setsid: the session leads its own process group, so a later head-moved kill
     # reaches its git/gh children instead of orphaning them on the worktree.
+    # The agent invocation is written to a file so the wrapper can run it verbatim
+    # (keeps argv quoting intact and makes a failed session reproducible by hand).
     case "$harness" in
       claude)
         # Keep the agent's cwd out of $BOT_DIR (config.json, logs/prompt-*.txt) and
@@ -574,14 +583,25 @@ EOF
         cd "$wtbase"
         export GIT_CONFIG_KEY_0="http.${GITHUB_BASE_URL%/}/$repo.git.extraheader"
         [ -n "$CLAUDE_CONFIG_DIR_EFF" ] && export CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR_EFF"
-        nohup setsid "$CLAUDE_BIN" "${cargs[@]}" < "$PROMPT_FILE" > "$SESSION_LOG" 2>&1 9>&- 7>&- &
+        { printf '#!/usr/bin/env bash\nexec'
+          printf ' %q' "$CLAUDE_BIN" "${cargs[@]}"
+          printf ' < %q\n' "$PROMPT_FILE"
+        } > "$AGENT_CMD_FILE"
         ;;
       *)
         cd "$BOT_DIR"
-        nohup setsid "$NODE" --expose-internals "$DSH_BIN" --profile headless --patch "$MODEL_PATCH" \
-          "$(cat "$PROMPT_FILE")" > "$SESSION_LOG" 2>&1 9>&- 7>&- &
+        { printf '#!/usr/bin/env bash\nexec'
+          printf ' %q' "$NODE" --expose-internals "$DSH_BIN" --profile headless \
+                        --patch "$MODEL_PATCH" "$(cat "$PROMPT_FILE")"
+          printf '\n'
+        } > "$AGENT_CMD_FILE"
         ;;
     esac
+    export REPO="$repo" PR="$pr" HARNESS="$harness" HEAD_SHA="$head_sha" \
+           STATUS_CID="$status_cid" AGENT_CMD="$AGENT_CMD_FILE" \
+           FINDINGS_FILE="$FINDINGS_JSON" AGENT_LOG="$AGENT_LOG" \
+           WT="$wt" MIRROR="$mirror" GH="$GH"
+    nohup setsid "$BOT_DIR/review-session.sh" > "$SESSION_LOG" 2>&1 9>&- 7>&- &
     echo $! > "$(pidfile_for "$repo" "$pr")"
   )
   mark_handled_pr "$repo" "$pr" "$reason" "$SESSION_LOG" "$head_sha" "$status_cid"
